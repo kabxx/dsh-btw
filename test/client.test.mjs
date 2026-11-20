@@ -324,7 +324,7 @@ test('exact command interception, text-only envelope and independent submit', as
   assert.equal((await (await match('/侧问  再问一句')).claim.submit('  再问一句 ')).kind, 'success')
   assert.deepEqual(call, [['main', '继续讨论'], ['main', '再问一句']])
   assert.equal(controller.getSnapshot().cards.main.id, 'created')
-  controller.dismiss('main')
+  controller.dismiss('main', 'created')
   assert.deepEqual(controller.getSnapshot().cards, {})
   controller.dispose()
 })
@@ -410,7 +410,7 @@ test('a card stays until dismissed or replaced by a newer accepted side question
     ctx.remote.btw.create = async () => accepted('newest')
     await controller.createCard('main', 'newest')
     assert.equal(controller.getSnapshot().cards.main.id, 'newest')
-    controller.dismiss('main')
+    controller.dismiss('main', 'newest')
     older.resolve(accepted('older'))
     await late
     assert.deepEqual(controller.getSnapshot().cards, {})
@@ -503,6 +503,49 @@ test('a card restores on return and page reopen until dismissed or moved to the 
     const afterMove = start()
     await afterMove.restoreCard('main')
     assert.deepEqual(afterMove.getSnapshot().cards, {})
+  } finally {
+    for (const controller of controllers) controller.dispose()
+    if (descriptor) Object.defineProperty(globalThis, 'localStorage', descriptor)
+    else delete globalThis.localStorage
+  }
+})
+
+test('dismissing an older card in another tab preserves the newer card on reload', async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+  const preferences = new Map()
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+    getItem: key => preferences.get(key) ?? null,
+    setItem: (key, value) => preferences.set(key, value),
+    removeItem: key => preferences.delete(key),
+  } })
+  const controllers = []
+  const start = () => {
+    const ctx = harness()
+    ctx.remote.btw.create = async (sessionId, id) => ({ ok: true, value: { sessionId, id } })
+    ctx.remote.btw.get = ctx.remote.btw.create
+    const controller = makeController(ctx)
+    controllers.push(controller)
+    return controller
+  }
+  try {
+    for (const closeOlder of [
+      controller => controller.dismiss('main', 'older'),
+      controller => assert.equal(controller.moveCardToSidebar('main', 'older'), true),
+    ]) {
+      preferences.clear()
+      const oldTab = start()
+      await oldTab.createCard('main', 'older')
+      await start().createCard('main', 'newer')
+      closeOlder(oldTab)
+      assert.deepEqual(oldTab.getSnapshot().cards, {})
+      const reloaded = start()
+      await reloaded.restoreCard('main')
+      assert.equal(reloaded.getSnapshot().cards.main.id, 'newer')
+      reloaded.dismiss('main', 'older')
+      assert.equal(reloaded.getSnapshot().cards.main.id, 'newer')
+      reloaded.dismiss('main', 'newer')
+      assert.equal(preferences.size, 0)
+    }
   } finally {
     for (const controller of controllers) controller.dispose()
     if (descriptor) Object.defineProperty(globalThis, 'localStorage', descriptor)

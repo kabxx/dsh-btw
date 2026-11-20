@@ -938,7 +938,7 @@ export function createViews(React) {
             try { setSidebarFailed(!controller.moveCardToSidebar(sessionId, id)); }
             catch { setSidebarFailed(true); }
           } }),
-          h(IconButton, { icon: 'close', label: t('dismiss'), onClick: () => controller.dismiss(sessionId) }))),
+          h(IconButton, { icon: 'close', label: t('dismiss'), onClick: () => controller.dismiss(sessionId, id) }))),
       sidebarFailed && h(Feedback, { text: t('sidebarUnavailable'), t, error: true }),
       expanded && h('div', { className: 'dsh-btw-inline-rule', 'aria-hidden': true }),
       h('div', { id: contentId, hidden: !expanded, className: expanded ? 'dsh-btw-inline-reply' : undefined }, expanded && h(Fragment, null,

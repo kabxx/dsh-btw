@@ -115,16 +115,24 @@ export function makeController(ctx) {
 
   function rememberCard(sessionId, id) {
     cardIds.set(sessionId, id)
-    try {
-      if (id === null) globalThis.localStorage?.removeItem(cardPreferencePrefix + sessionId)
-      else globalThis.localStorage?.setItem(cardPreferencePrefix + sessionId, id)
-    } catch { /* The current page can still remember the card in memory. */ }
+    try { globalThis.localStorage?.setItem(cardPreferencePrefix + sessionId, id) }
+    catch { /* The current page can still remember the card in memory. */ }
   }
 
-  function dismissCard(id) {
-    rememberCard(id, null)
+  function forgetCard(sessionId, id) {
+    cardIds.set(sessionId, null)
+    try {
+      const storage = globalThis.localStorage
+      const key = cardPreferencePrefix + sessionId
+      if (storage?.getItem(key) === id) storage.removeItem(key)
+    } catch { /* The current page can still dismiss the card in memory. */ }
+  }
+
+  function dismissCard(sessionId, id) {
+    if (snapshot.cards[sessionId]?.id !== id) return
+    forgetCard(sessionId, id)
     const cards = { ...snapshot.cards }
-    delete cards[id]
+    delete cards[sessionId]
     publish({ cards })
   }
 
@@ -140,7 +148,7 @@ export function makeController(ctx) {
         publish({ cards: { ...snapshot.cards, [sessionId]: detail } })
       }
     } catch (error) {
-      if (stillCurrent() && error.code === 'btw/not-found') rememberCard(sessionId, null)
+      if (stillCurrent() && error.code === 'btw/not-found') forgetCard(sessionId, id)
     }
   }
 
@@ -240,7 +248,7 @@ export function makeController(ctx) {
     openDetail: (sessionId, id) => open(sessionId, id),
     moveCardToSidebar(sessionId, id) {
       if (snapshot.cards[sessionId]?.id !== id || !open(sessionId, id)) return false
-      if (snapshot.cards[sessionId]?.id === id) dismissCard(sessionId)
+      dismissCard(sessionId, id)
       return true
     },
     navigate(sessionId, id) {
