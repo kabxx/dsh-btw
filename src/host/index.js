@@ -5,7 +5,7 @@ import { resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 import {
-  CONTEXT_OVERFLOW, PACKAGE_NAME, TOKEN_FIELDS, contextDescriptor, parseDetail, parseQuestion, parseSessionId, parseThreadId, parseVersion, threadDescriptor,
+  CONTEXT_OVERFLOW, PACKAGE_NAME, TOKEN_FIELDS, contextDescriptor, parseDetail, parseQuestion, parseSessionId, parseSubmissionId, parseThreadId, parseVersion, submitFollowupDescriptor, threadDescriptor,
 } from '../shared/wire.js'
 import { sessionThreadStore } from './session-store.js'
 
@@ -93,6 +93,9 @@ const nativeSnapshot = z.strictObject({
   measuredPrefix: tokenCount.optional(),
 })
 const turnSchema = z.strictObject({
+  submissionId: z.string().refine(value => {
+    try { parseSubmissionId(value); return true } catch { return false }
+  }).optional(),
   question: z.string().min(1),
   reply: z.string(),
   status: z.enum(['generating', 'completed', 'failed', 'interrupted']),
@@ -133,7 +136,7 @@ function newest(record) {
   return record.turns.at(-1)
 }
 
-function publicTurn({ modelReply, ...fields }) {
+function publicTurn({ modelReply, submissionId, ...fields }) {
   return fields
 }
 
@@ -574,25 +577,42 @@ export class BtwHost {
     })
   }
 
-  followup(sessionId, id, question, signal) {
+  followup(sessionId, id, question, signal, submissionId) {
     signal?.throwIfAborted()
     this.lifetime.signal.throwIfAborted()
     parseQuestion(question)
     const record = this.read(sessionId, id)
-    if (this.runs.get(id)?.state === this.sessions.get(sessionId) || !isDone(record)) throw fault('generating', '上一条回复仍在生成。')
+    const active = this.runs.get(id)
+    const state = this.sessions.get(sessionId)
+    const receipt = (admitted, turnIndex) => {
+      const { usage, ...turn } = publicTurn(admitted.turns[turnIndex])
+      return { id, sessionId, updatedAt: admitted.updatedAt, version: admitted.version, turnIndex, turn }
+    }
+    if (submissionId !== undefined) {
+      parseSubmissionId(submissionId)
+      const turnIndex = record.turns.findIndex(turn => turn.submissionId === submissionId)
+      if (turnIndex !== -1) {
+        if (record.turns[turnIndex].question !== question) throw fault('submission-mismatch', '侧问提交内容不一致。')
+        return Promise.resolve(receipt(record, turnIndex))
+      }
+      if (active?.state === state && active.submission?.submissionId === submissionId) {
+        if (active.submission.question !== question) throw fault('submission-mismatch', '侧问提交内容不一致。')
+        return active.admission
+      }
+    }
+    if (active?.state === state || !isDone(record)) throw fault('generating', '上一条回复仍在生成。')
     if (newest(record).error === CONTEXT_OVERFLOW) throw fault('context-overflow', '已达上下文上限。')
     const time = Math.max(Date.now(), record.updatedAt)
     const turns = record.turns.map(({ saveError, ...turn }) => turn)
-    return this.admit(nextRevision(record, [...turns, nextTurn(question, time)], time), admitted => {
-      const { usage, ...turn } = publicTurn(newest(admitted))
-      return { id, sessionId, updatedAt: admitted.updatedAt, version: admitted.version, turnIndex: admitted.turns.length - 1, turn }
-    })
+    const turn = nextTurn(question, time)
+    if (submissionId !== undefined) turn.submissionId = submissionId
+    return this.admit(nextRevision(record, [...turns, turn], time), admitted => receipt(admitted, turns.length))
   }
 
   admit(record, result = toDetail) {
     const controller = new AbortController()
     const state = this.sessions.get(record.sessionId)
-    const run = { controller, state }
+    const run = { controller, state, submission: newest(record) }
     this.runs.set(record.id, run)
     const admission = Promise.resolve(state.terminalWrites.get(record.id)).catch(() => {}).then(() => this.save(record, state)).then(() => {
       state.controller.signal.throwIfAborted()
@@ -609,6 +629,7 @@ export class BtwHost {
       this.logger?.error('BTW could not admit a question')
       throw fault('save-failed', '保存侧问失败。')
     })
+    run.admission = admission
     this.admissions.add(admission)
     admission.then(() => this.admissions.delete(admission), () => this.admissions.delete(admission))
     return admission
@@ -856,7 +877,7 @@ export default class BtwService extends TypertRemoteService {
     // contribution with the live plugin so an installed update exposes it immediately.
     this.ctx.typert.register({
       package: `${PACKAGE_NAME}-meter`, face: 'host', schemas: [],
-      model: { services: [], events: [], objects: [] }, invocations: [contextDescriptor, threadDescriptor],
+      model: { services: [], events: [], objects: [] }, invocations: [contextDescriptor, threadDescriptor, submitFollowupDescriptor],
     })
   }
 
@@ -899,6 +920,11 @@ export default class BtwService extends TypertRemoteService {
   async followup(agent, id, question, signal) {
     const { sessionId } = await this.prepare(agent, signal)
     return this.host.followup(sessionId, id, question, signal)
+  }
+
+  async submitFollowup(agent, id, question, submissionId, signal) {
+    const { sessionId } = await this.prepare(agent, signal)
+    return this.host.followup(sessionId, id, question, signal, submissionId)
   }
 
   async *watch(agent, id, version, signal) {

@@ -300,7 +300,7 @@ test('installed DSH strict Gateway lookup, owner authorization and business APIs
   const guest = { ...peer, id: 'guest-fixture', principal: { kind: 'guest' } }
   const invoke = (method, args, caller = peer, signal) => ctx.typertGateway.invoke({ namespace: 'btw', method, args, peer: caller, signal })
   try {
-    assert.deepEqual([...TYPERT.invocations, ctx.typert.local.get('btw/contextCapacity'), ctx.typert.local.get('btw/watchThread')], TYPERT_REMOTE.descriptors)
+    assert.deepEqual([...TYPERT.invocations, ctx.typert.local.get('btw/contextCapacity'), ctx.typert.local.get('btw/watchThread'), ctx.typert.local.get('btw/submitFollowup')], TYPERT_REMOTE.descriptors)
     await assert.rejects(invoke('list', { agentId: 'session-A' }, guest), error => error.code === 'remote-access/denied')
     assert.equal(lookups, 0, 'non-owner was refused before the session lookup')
     await assert.rejects(invoke('list', { agentId: 'session-missing' }))
@@ -404,7 +404,12 @@ test('installed DSH strict Gateway lookup, owner authorization and business APIs
     assert.deepEqual(tabBDetail, completed)
     const firstUpdateInA = tabAStream.next()
     const firstUpdateInB = tabBStream.next()
-    const followup = await invoke('followup', { ...detailArgs, question: 'continue here' }, otherPeer)
+    const submission = { ...detailArgs, question: 'continue here', submissionId: 'a'.repeat(32) }
+    const firstSubmission = invoke('submitFollowup', submission, otherPeer)
+    const duplicate = invoke('submitFollowup', submission)
+    const followup = await firstSubmission
+    assert.deepEqual(await duplicate, followup)
+    assert.equal(Object.hasOwn(followup.turn, 'submissionId'), false)
     const admitted = (await firstUpdateInA).value
     tabADetail = applyThreadEvent(tabADetail, admitted)
     tabBDetail = applyThreadEvent(tabBDetail, (await firstUpdateInB).value)
@@ -467,6 +472,21 @@ test('installed DSH strict Gateway lookup, owner authorization and business APIs
     tabB.abort()
     await Promise.all([tabAStream.return(), tabBStream.return()])
     assert.deepEqual(detail.turns.map(turn => turn.reply), ['visible text', '可以复用'])
+    const storedReceipt = await invoke('submitFollowup', submission)
+    assert.equal(storedReceipt.turnIndex, 1)
+    assert.equal(storedReceipt.turn.reply, '可以复用')
+    assert.equal(llm.calls.length, 2)
+    const reopened = new BtwHost({
+      store: sessionThreadStore({ stat: async () => ({ location: folder.location }) }, record => threadSchema.parse(record)),
+      llm,
+    })
+    try {
+      await reopened.prepare('session-A')
+      assert.deepEqual(await reopened.followup('session-A', first.id, submission.question, undefined, submission.submissionId), storedReceipt)
+      assert.equal(llm.calls.length, 2, 'resubmitting after restart does not start another request')
+    } finally {
+      await reopened.close()
+    }
     assert.deepEqual(parseDetail(detail), detail)
     const followupContext = await invoke('contextCapacity', detailArgs)
     assert.equal(followupContext.contextWindow, 128_000)

@@ -215,17 +215,19 @@ export function makeController(ctx) {
     },
     setDraft(sessionId, id, text) {
       const draft = getDraft(sessionId, id)
-      publishDraft(sessionId, id, { ...draft, text, revision: draft.revision + 1, error: undefined })
+      publishDraft(sessionId, id, { ...draft, text, revision: draft.revision + 1, error: undefined, submissionId: undefined })
     },
     async submitDraft(sessionId, id) {
       const draft = getDraft(sessionId, id)
       if (disposed || draft.saving || !draft.text.trim()) return
-      publishDraft(sessionId, id, { ...draft, saving: true, error: undefined })
+      const submissionId = draft.submissionId ?? Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)),
+        byte => byte.toString(16).padStart(2, '0')).join('')
+      publishDraft(sessionId, id, { ...draft, submissionId, saving: true, error: undefined })
       try {
-        const receipt = unwrap(await ctx.remote.btw.followup(sessionId, id, draft.text))
+        const receipt = unwrap(await ctx.remote.btw.submitFollowup(sessionId, id, draft.text, submissionId))
         const current = getDraft(sessionId, id)
         const remaining = current.revision === draft.revision
-          ? { text: '', revision: current.revision + 1 } : {}
+          ? { text: '', revision: current.revision + 1, submissionId: undefined } : {}
         publishDraft(sessionId, id, { ...current, ...remaining, saving: false, receipt })
       } catch (error) {
         const messageKey = error?.code === 'btw/context-overflow' ? 'contextOverflow'

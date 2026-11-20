@@ -21,6 +21,10 @@ export function parseQuestion(value) {
   return checked(value, typeof value === 'string' && value.trim() !== '', 'question')
 }
 
+export function parseSubmissionId(value) {
+  return checked(value, typeof value === 'string' && /^[\da-f]{32}$/u.test(value), 'submissionId')
+}
+
 export function parseVersion(value) {
   return checked(value, Number.isSafeInteger(value) && value >= 1, 'version')
 }
@@ -242,5 +246,6 @@ function parseThreadEvent(value) {
 
 export const contextDescriptor = descriptor('contextCapacity', [id], codec(`${PACKAGE_NAME}#ContextWindow`, parseContext))
 export const threadDescriptor = descriptor('watchThread', [id], codec(`${PACKAGE_NAME}#ThreadEvent`, parseThreadEvent), true)
-export const TYPERT_REMOTE = Object.freeze({ package: PACKAGE_NAME, descriptors: Object.freeze([...descriptors, contextDescriptor, threadDescriptor]) })
+export const submitFollowupDescriptor = descriptor('submitFollowup', [id, question, parameter('submissionId', parseSubmissionId)], receipt)
+export const TYPERT_REMOTE = Object.freeze({ package: PACKAGE_NAME, descriptors: Object.freeze([...descriptors, contextDescriptor, threadDescriptor, submitFollowupDescriptor]) })
 export const createBtwContribution = () => TYPERT_REMOTE

@@ -194,7 +194,7 @@ test('unsent drafts stay with their session and thread until that draft is accep
     assert.equal(controller.getDraft('other', 'first').text, 'Draft C')
 
     let sends = 0
-    ctx.remote.btw.followup = (session, id, text) => {
+    ctx.remote.btw.submitFollowup = (session, id, text) => {
       assert.deepEqual([session, id, text], ['main', 'first', 'Draft A'])
       sends += 1
       return receipt.promise
@@ -213,7 +213,7 @@ test('unsent drafts stay with their session and thread until that draft is accep
     assert.equal(controller.getDraft('main', 'first').saving, false)
 
     const rejection = Promise.withResolvers()
-    ctx.remote.btw.followup = () => rejection.promise
+    ctx.remote.btw.submitFollowup = () => rejection.promise
     const rejected = controller.submitDraft('main', 'first')
     const checked = assert.rejects(rejected, /rejected/)
     ctx.mounted.set('other')
@@ -223,7 +223,7 @@ test('unsent drafts stay with their session and thread until that draft is accep
     assert.equal(controller.getDraft('main', 'first').text, 'New input while sending')
     assert.equal(controller.getDraft('main', 'first').error, 'sendFailed')
     assert.equal(controller.getDraft('main', 'second').error, undefined)
-    ctx.remote.btw.followup = async () => ({ ok: true, value: { turnIndex: 2 } })
+    ctx.remote.btw.submitFollowup = async () => ({ ok: true, value: { turnIndex: 2 } })
     await controller.submitDraft('main', 'first')
     assert.equal(controller.getDraft('main', 'first').text, '')
     assert.equal(controller.getDraft('main', 'first').error, undefined)
@@ -239,10 +239,36 @@ test('unsent drafts stay with their session and thread until that draft is accep
   }
 })
 
+test('a lost follow-up receipt keeps the same submission ID until the question is accepted', async () => {
+  const ctx = harness()
+  const controller = makeController(ctx)
+  const ids = []
+  ctx.remote.btw.submitFollowup = async (_session, _thread, _question, id) => {
+    ids.push(id)
+    if (ids.length === 1) throw new Error('response lost')
+    return { ok: true, value: { turnIndex: 1 } }
+  }
+  try {
+    controller.setDraft('main', 'thread', 'continue')
+    await assert.rejects(controller.submitDraft('main', 'thread'), /response lost/)
+    ctx.mounted.set('other')
+    ctx.mounted.set('main')
+    await controller.submitDraft('main', 'thread')
+    assert.match(ids[0], /^[a-f0-9]{32}$/u)
+    assert.equal(ids[1], ids[0])
+    assert.equal(controller.getDraft('main', 'thread').text, '')
+    controller.setDraft('main', 'thread', 'continue')
+    await controller.submitDraft('main', 'thread')
+    assert.notEqual(ids[2], ids[0], 'a new intentional submission has its own ID')
+  } finally {
+    controller.dispose()
+  }
+})
+
 test('a competing follow-up retains the draft and reports that the reply is generating', async () => {
   const ctx = harness()
   const controller = makeController(ctx)
-  ctx.remote.btw.followup = async () => ({ ok: false, error: { code: 'btw/generating', message: 'Host rejection' } })
+  ctx.remote.btw.submitFollowup = async () => ({ ok: false, error: { code: 'btw/generating', message: 'Host rejection' } })
   try {
     controller.setDraft('main', 'thread', 'still unsent')
     await assert.rejects(controller.submitDraft('main', 'thread'), { code: 'btw/generating' })
