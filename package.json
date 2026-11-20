@@ -1,0 +1,39 @@
+{
+  "name": "@kabxx/dsh-btw",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Inline /btw side questions and sidebar follow-ups for DeepSeek Harness.",
+  "repository": { "type": "git", "url": "https://github.com/kabxx/dsh-btw.git" },
+  "bugs": { "url": "https://github.com/kabxx/dsh-btw/issues" },
+  "engines": { "node": ">=24.9.0", "dsh": "0.2.2-rc.5" },
+  "scripts": {
+    "build": "node scripts/build-client.mjs",
+    "test": "node --test test/*.test.mjs",
+    "prepack": "npm run build",
+    "pack:local": "npm pack --pack-destination dist"
+  },
+  "exports": {
+    ".": "./src/host/index.js",
+    "./client": "./dist/client.js",
+    "./typert": "./src/host/typert.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": ["src/host/", "src/shared/", "dist/client.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "NOTICE"],
+  "devDependencies": { "esbuild": "0.28.2" },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-api-gateway",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-input-trigger",
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-theme"
+      ]
+    }
+  }
+}

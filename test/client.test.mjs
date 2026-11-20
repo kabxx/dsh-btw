@@ -1,0 +1,489 @@
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+import { createRequire } from 'node:module'
+import { resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { inject, makeController, makeSource, mountClient } from '../src/client/index.js'
+import { appendTurn, applyReply, parseSessionId, parseTurn } from '../src/shared/wire.js'
+import { contextReading, formatMessageTime, formatTokenCount, orderHistory, summarizeUsage } from '../src/client/views.js'
+import zh from '../locale/zh.json' with { type: 'json' }
+import en from '../locale/en.json' with { type: 'json' }
+
+function snapshot(initial) {
+  let current = initial
+  const listeners = new Set()
+  return {
+    getSnapshot: () => current,
+    set(next) { current = next; for (const listen of [...listeners]) listen() },
+    subscribe(listen) { listeners.add(listen); return () => listeners.delete(listen) },
+  }
+}
+
+function harness() {
+  const mounted = snapshot('main')
+  const files = { id: 'files', kind: 'files' }
+  const old = { id: 'old-btw', kind: 'kabxx-btw' }
+  const tabs = new Map([['main', [files, old]]])
+  const inventory = () => [...tabs].flatMap(([sessionId, records]) => records.map(tab => ({
+    sessionId, tabId: tab.id, kind: tab.kind, contentId: tab.kind,
+  })))
+  const openTabs = snapshot(inventory())
+  const expanded = new Map()
+  const sidebarRight = {
+    mounted, openTabs,
+    tabsIn: id => tabs.get(id) ?? [],
+    isExpanded: () => expanded.get(mounted.getSnapshot()) ?? false,
+    toggleExpanded: () => expanded.set(mounted.getSnapshot(), !sidebarRight.isExpanded()),
+    openTabIn(id, kind) {
+      expanded.set(id, true)
+      if (sidebarRight.tabsIn(id).some(tab => tab.kind === kind)) return
+      tabs.set(id, [...sidebarRight.tabsIn(id), { id: kind, kind }])
+      openTabs.set(inventory())
+    },
+    closeIn(id, tabId) {
+      tabs.set(id, sidebarRight.tabsIn(id).filter(tab => tab.id !== tabId))
+      openTabs.set(inventory())
+    },
+  }
+  return { sidebarRight, mounted, files, remote: { btw: {} } }
+}
+
+test('usage follows the main chat cache buckets and keeps genuinely unknown usage absent', () => {
+  const settled = usage => ({ status: 'completed', usage })
+  assert.deepEqual(summarizeUsage([settled({ inputTokens: 100, outputTokens: 20 })]), {
+    uncached: 100, cacheRead: 0, cacheWrite: 0, output: 20, total: 120, cacheRatio: 0,
+  })
+  assert.deepEqual(summarizeUsage([
+    settled({ inputTokens: 100, outputTokens: 20 }),
+    settled({ inputTokens: 80, cacheReadTokens: 50, cacheWriteTokens: 20, outputTokens: 10 }),
+    { status: 'generating', usage: { inputTokens: 800, outputTokens: 2 } },
+  ]), { uncached: 180, cacheRead: 50, cacheWrite: 20, output: 30, total: 280, cacheRatio: 0.2 })
+  assert.deepEqual(summarizeUsage([settled(), settled({ totalTokens: 9 })]), {
+    uncached: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 9, cacheRatio: null,
+  })
+  assert.equal(summarizeUsage([settled()]).total, 0)
+})
+
+test('sidebar formats token counts and clocks like the host and renders the estimated context separately', () => {
+  assert.equal(formatTokenCount(81_000), '81K')
+  assert.equal(formatTokenCount(12_230), '12.2K')
+  assert.equal(formatTokenCount(1_240_000), '1.2M')
+  const today = new Date(2026, 10, 20, 9, 0).getTime()
+  assert.equal(formatMessageTime(today, 'zh-CN', today), '09:00')
+  assert.equal(formatMessageTime(new Date(2026, 10, 19, 8, 5).getTime(), 'zh-CN', today), '11月19日 08:05')
+  assert.equal(formatMessageTime(new Date(2025, 10, 19, 8, 5).getTime(), 'zh-CN', today), '2025年11月19日 08:05')
+  assert.deepEqual(contextReading({ contextWindow: 200, estimatedTokens: 50 }), { used: 50, contextWindow: 200, percent: 25 })
+  assert.equal(contextReading({ contextWindow: 200 }), null)
+  assert.equal(contextReading({ contextWindow: null }), null)
+})
+
+test('history places the newest creation last without reordering the received rows', () => {
+  const rows = [
+    { id: 'late', createdAt: 3, updatedAt: 4 },
+    { id: 'b', createdAt: 2, updatedAt: 4 },
+    { id: 'a', createdAt: 2, updatedAt: 3 },
+    { id: 'early', createdAt: 1, updatedAt: 20 },
+  ]
+  assert.deepEqual(orderHistory(rows).map(row => row.id), ['early', 'a', 'b', 'late'])
+  assert.deepEqual(rows.map(row => row.id), ['late', 'b', 'a', 'early'])
+})
+
+const flush = () => new Promise(resolve => queueMicrotask(resolve))
+
+// Exercise transitions against the native sidebar's per-session inventory shape.
+test('switching sessions keeps each sidebar destination and respects explicit collapse and close', async () => {
+  const ctx = harness()
+  const { sidebarRight, mounted } = ctx
+  const controller = makeController(ctx)
+  try {
+    await flush()
+    assert.equal(controller.getSnapshot().performanceUsage, 'detailed')
+    controller.setPerformanceUsage('compact')
+    assert.equal(controller.getSnapshot().performanceUsage, 'compact')
+    assert.deepEqual(sidebarRight.tabsIn('main'), [ctx.files])
+    assert.equal(controller.getSnapshot().pane, null)
+
+    assert.equal(controller.openDetail('main', 'thread'), true)
+    const reveal = sidebarRight.openTabIn
+    sidebarRight.openTabIn = () => assert.fail('in-pane navigation must not open or focus a native tab')
+    controller.navigate('main', null)
+    assert.equal(controller.getSnapshot().pane.id, null)
+    controller.navigate('main', 'thread')
+    assert.equal(controller.getSnapshot().pane.id, 'thread')
+    sidebarRight.openTabIn = reveal
+    mounted.set('other')
+    assert.equal(controller.getSnapshot().pane, null)
+    assert.equal(controller.openList('main'), false)
+    assert.equal(controller.openList('other'), true)
+    mounted.set('main')
+    await flush()
+    assert.equal(sidebarRight.isExpanded(), true)
+    assert.deepEqual(controller.getSnapshot().pane, { sessionId: 'main', id: 'thread', restored: true })
+    assert.equal(sidebarRight.tabsIn('main').length, 2)
+
+    sidebarRight.toggleExpanded()
+    mounted.set('other')
+    assert.equal(controller.getSnapshot().pane.id, null)
+    mounted.set('main')
+    assert.equal(sidebarRight.isExpanded(), false)
+    assert.equal(controller.getSnapshot().pane.id, 'thread')
+
+    sidebarRight.closeIn('main', 'kabxx-btw')
+    mounted.set('other')
+    mounted.set('main')
+    await flush()
+    assert.equal(controller.getSnapshot().pane, null)
+    assert.deepEqual(sidebarRight.tabsIn('main'), [ctx.files])
+  } finally {
+    controller.dispose()
+  }
+})
+
+test('exact command interception, text-only envelope and independent submit', async () => {
+  const ctx = harness()
+  const call = []
+  ctx.remote.btw.create = async (id, question) => {
+    call.push([id, question])
+    return { ok: true, value: { id: 'created' } }
+  }
+  const controller = makeController(ctx)
+  const icon = () => null
+  const source = makeSource(controller, key => zh.ui[key] ?? key, icon)
+  const signal = new AbortController().signal
+  const session = { sessionId: 'main' }
+  const menu = query => source.candidates(session, { query, position: 'leading' })
+  const [candidate] = await menu('')
+  assert.deepEqual(candidate, { name: 'btw', label: '侧问', description: '发起侧问，或查看当前会话的侧问记录', icon })
+  assert.deepEqual(await menu('bt'), [candidate])
+  assert.deepEqual(await menu('侧'), [candidate])
+  assert.deepEqual(await menu('goal'), [])
+  const picked = source.onPick({ session, position: 'leading', candidate })
+  assert.equal(picked.claim.token, '/侧问 ')
+  assert.equal((await picked.claim.submit('')).kind, 'success')
+  assert.equal((await source.matchClaim(session, '/侧问', signal)).token, '/侧问 ')
+  assert.equal((await source.matchClaim(session, '/btw', signal)).token, '/btw ')
+  const english = makeSource(controller, key => key === 'commandSpelling' ? 'btw' : key, icon)
+  assert.equal(english.onPick({ session, position: 'leading', candidate }).claim.token, '/btw ')
+  const match = (value, attachments = 0) => source.matchEnter(session, value, signal, { attachments })
+  assert.equal(await match('/btw-other x'), undefined)
+  assert.equal(await match('/侧问其他 x'), undefined)
+  assert.equal(await match('/goal x'), undefined)
+  assert.equal(await match('/BTW x'), undefined)
+  await assert.rejects(match('/btw hi', 1), { message: zh.ui.textOnly })
+  await assert.rejects(match('/侧问 hi', 1), { message: zh.ui.textOnly })
+  assert.equal((await match('/btw')).claim.token, '/btw ')
+  assert.equal((await match('/侧问')).claim.token, '/侧问 ')
+  assert.equal((await (await match('/btw')).claim.submit('')).kind, 'success')
+  assert.equal((await (await match('/侧问')).claim.submit('')).kind, 'success')
+  assert.equal(controller.getSnapshot().pane.id, null)
+  assert.equal((await (await match('/btw  继续讨论')).claim.submit('  继续讨论 ')).kind, 'success')
+  assert.equal((await (await match('/侧问  再问一句')).claim.submit('  再问一句 ')).kind, 'success')
+  assert.deepEqual(call, [['main', '继续讨论'], ['main', '再问一句']])
+  assert.equal(controller.getSnapshot().cards.main.id, 'created')
+  controller.dismiss('main')
+  assert.deepEqual(controller.getSnapshot().cards, {})
+  controller.dispose()
+})
+
+test('an unsaved session uses the localized native command error while leaving list access available', async () => {
+  const ctx = harness()
+  const session = { sessionId: 'main' }
+  const signal = new AbortController().signal
+  const controller = makeController(ctx)
+  const rejected = { ok: false, error: { code: 'btw/session-not-saved', message: 'Host fallback' } }
+  const draft = '我的草稿'
+  try {
+    for (const locale of [zh.ui, en.ui]) {
+      const source = makeSource(controller, key => locale[key])
+      const match = line => source.matchEnter(session, line, signal, { attachments: 0 })
+      ctx.remote.btw.create = async (id, question) => {
+        assert.equal(id, session.sessionId)
+        assert.equal(question, draft)
+        return rejected
+      }
+      const { claim } = await match(`/侧问 ${draft}`)
+      assert.deepEqual(await claim.submit(draft), { kind: 'error', text: locale.sessionNotSaved })
+      assert.deepEqual(controller.getSnapshot().cards, {})
+      const list = await match('/btw')
+      assert.deepEqual(await list.claim.submit(''), { kind: 'success' })
+      assert.equal(controller.getSnapshot().pane.id, null)
+      for (const [code, text] of [
+        ['btw/model-unavailable', locale.modelUnavailable],
+        ['btw/save-failed', locale.saveFailed],
+      ]) {
+        ctx.remote.btw.create = async () => ({ ok: false, error: { code, message: 'Host fallback' } })
+        assert.deepEqual(await claim.submit(draft), { kind: 'error', text })
+      }
+      ctx.remote.btw.create = async () => ({ ok: false, error: { code: 'btw/unexpected', message: 'Host fallback' } })
+      await assert.rejects(claim.submit(draft), { code: 'btw/unexpected', message: 'Host fallback' })
+    }
+  } finally {
+    controller.dispose()
+  }
+})
+
+test('explicitly reopening history resets its position but adding a card only refreshes the contents', async () => {
+  const ctx = harness()
+  ctx.remote.btw.create = async () => ({ ok: true, value: { id: 'new' } })
+  const controller = makeController(ctx)
+  try {
+    assert.equal(controller.openList('main'), true)
+    const first = controller.getSnapshot()
+    await controller.createCard('main', 'question')
+    assert.equal(controller.getSnapshot().pane.listOpenedAt, first.pane.listOpenedAt)
+    assert.ok(controller.getSnapshot().listRevision > first.listRevision)
+    assert.equal(controller.openList('main'), true)
+    assert.ok(controller.getSnapshot().pane.listOpenedAt > first.pane.listOpenedAt)
+  } finally {
+    controller.dispose()
+  }
+})
+
+test('a card stays until dismissed or replaced by a newer accepted side question', async () => {
+  const ctx = harness()
+  const controller = makeController(ctx)
+  const accepted = id => ({ ok: true, value: { id } })
+  try {
+    ctx.remote.btw.create = async () => accepted('first')
+    await controller.createCard('main', 'first')
+    controller.openList('main')
+    controller.openDetail('main', 'first')
+    assert.equal(controller.getSnapshot().cards.main.id, 'first')
+
+    const next = Promise.withResolvers()
+    ctx.remote.btw.create = () => next.promise
+    const pending = controller.createCard('main', 'next')
+    ctx.remote.btw.create = async () => ({ ok: false, error: { message: 'rejected' } })
+    await assert.rejects(controller.createCard('main', 'rejected'), /rejected/)
+    assert.equal(controller.getSnapshot().cards.main.id, 'first')
+    next.resolve(accepted('next'))
+    await pending
+    assert.equal(controller.getSnapshot().cards.main.id, 'next')
+
+    const older = Promise.withResolvers()
+    ctx.remote.btw.create = () => older.promise
+    const late = controller.createCard('main', 'older')
+    ctx.remote.btw.create = async () => accepted('newest')
+    await controller.createCard('main', 'newest')
+    assert.equal(controller.getSnapshot().cards.main.id, 'newest')
+    controller.dismiss('main')
+    older.resolve(accepted('older'))
+    await late
+    assert.deepEqual(controller.getSnapshot().cards, {})
+  } finally {
+    controller.dispose()
+  }
+})
+
+test('a card restores on return and page reopen until explicitly dismissed, without restoring the sidebar on refresh', async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+  const preferences = new Map()
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+    getItem: key => preferences.get(key) ?? null,
+    setItem: (key, value) => preferences.set(key, value),
+    removeItem: key => preferences.delete(key),
+  } })
+  const ctx = harness()
+  const crashed = { id: 'finished', sessionId: 'main', turns: [{ reply: 'saved reply' }] }
+  const controllers = []
+  const start = () => {
+    const controller = makeController(ctx)
+    controllers.push(controller)
+    return controller
+  }
+  ctx.remote.btw.create = async () => ({ ok: true, value: { ...crashed, turns: [] } })
+  ctx.remote.btw.get = async (sessionId, id) => {
+    assert.equal(sessionId, 'main')
+    assert.equal(id, 'finished')
+    return { ok: true, value: crashed }
+  }
+  try {
+    const first = start()
+    await flush()
+    await first.createCard('main', 'question')
+    first.openDetail('main', 'finished')
+    ctx.mounted.set('other')
+    await first.restoreCard('other')
+    assert.deepEqual(first.getSnapshot().cards, {})
+    ctx.mounted.set('main')
+    await first.restoreCard('main')
+    assert.deepEqual(first.getSnapshot().cards.main, crashed)
+    assert.equal(first.getSnapshot().pane.id, 'finished')
+    first.dispose()
+
+    // The native layout can still contain a disk-restored tab on a page load.
+    ctx.sidebarRight.openTabIn('main', 'kabxx-btw')
+    const reopened = start()
+    await flush()
+    await reopened.restoreCard('main')
+    assert.deepEqual(ctx.sidebarRight.tabsIn('main'), [ctx.files])
+    assert.equal(reopened.getSnapshot().pane, null)
+    assert.deepEqual(reopened.getSnapshot().cards.main, crashed)
+    reopened.dismiss('main')
+    reopened.dispose()
+
+    const afterDismiss = start()
+    await afterDismiss.restoreCard('main')
+    assert.deepEqual(afterDismiss.getSnapshot().cards, {})
+  } finally {
+    for (const controller of controllers) controller.dispose()
+    if (descriptor) Object.defineProperty(globalThis, 'localStorage', descriptor)
+    else delete globalThis.localStorage
+  }
+})
+
+test('a late create receipt is remembered only for its own session', async () => {
+  const ctx = harness()
+  const receipt = Promise.withResolvers()
+  ctx.remote.btw.create = () => receipt.promise
+  const detail = { id: 'accepted', sessionId: 'main' }
+  ctx.remote.btw.get = async () => ({ ok: true, value: detail })
+  const controller = makeController(ctx)
+  try {
+    const pending = controller.createCard('main', 'question')
+    ctx.mounted.set('other')
+    receipt.resolve({ ok: true, value: detail })
+    await pending
+    assert.deepEqual(controller.getSnapshot().cards, {})
+    ctx.mounted.set('main')
+    await controller.restoreCard('main')
+    assert.equal(controller.getSnapshot().cards.main, detail)
+  } finally {
+    controller.dispose()
+  }
+})
+
+test('dictation takes duration, byte budget and selection from the DSH catalog per recording', async () => {
+  const ctx = harness()
+  const requests = []
+  ctx.remote.speech = {
+    async transcribe(request, signal) {
+      requests.push({ request, signal })
+      return { ok: true, value: { text: 'draft' } }
+    },
+  }
+  const controller = makeController(ctx)
+  try {
+    const catalog = (providerId, maxDurationSeconds, maxAudioBytes) => ({
+      selection: { providerId }, maxDurationSeconds, maxAudioBytes,
+      providers: [{ id: providerId, preparation: { phase: 'ready' } }],
+    })
+    assert.equal(controller.beginDictation(), undefined)
+    controller.setSpeechCatalog({ ...catalog('first', 73, 4), providers: [{ id: 'first', preparation: { phase: 'unprepared' } }] }, ctx.remote.speech)
+    assert.equal(controller.getSnapshot().speechMounted, true)
+    assert.equal(controller.getSnapshot().dictationAvailable, false)
+    assert.equal(controller.beginDictation(), undefined)
+    controller.setSpeechCatalog(catalog('first', 73, 4), ctx.remote.speech)
+    const first = controller.beginDictation()
+    controller.setSpeechCatalog(catalog('second', 14, 9), ctx.remote.speech)
+    const second = controller.beginDictation()
+    assert.equal(first.maxDurationSeconds, 73)
+    assert.equal(second.maxDurationSeconds, 14)
+    const signal = new AbortController().signal
+    await assert.rejects(first.transcribe(new Blob(['abcde']), signal), /too large/)
+    assert.equal(await first.transcribe(new Blob(['abcd']), signal), 'draft')
+    assert.equal(await second.transcribe(new Blob(['abcde']), signal), 'draft')
+    assert.deepEqual(requests, [
+      { request: { audioBase64: 'YWJjZA==', providerId: 'first' }, signal },
+      { request: { audioBase64: 'YWJjZGU=', providerId: 'second' }, signal },
+    ])
+    controller.setSpeechCatalog(undefined)
+    assert.equal(controller.getSnapshot().speechMounted, false)
+    assert.equal(controller.beginDictation(), undefined)
+  } finally {
+    controller.dispose()
+  }
+})
+
+test('dropping a UI subscription aborts only its own Remote stream', async () => {
+  const ctx = harness()
+  const signals = []
+  ctx.remote.btw.watch = function (session, thread, version, signal) {
+    assert.equal(session, 'main')
+    assert.equal(version, null)
+    signals.push(signal)
+    return (async function* () {
+      yield { id: thread }
+      if (!signal.aborted) await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))
+    })()
+  }
+  const controller = makeController(ctx)
+  const first = Promise.withResolvers()
+  const second = Promise.withResolvers()
+  const stop = controller.watch('main', 'thread', first.resolve)
+  controller.watch('main', 'thread', second.resolve)
+  assert.equal((await first.promise).id, 'thread')
+  await second.promise
+  stop()
+  assert.equal(signals[0].aborted, true)
+  assert.equal(signals[1].aborted, false)
+  controller.dispose()
+  assert.equal(signals[1].aborted, true)
+})
+
+test('side pane appends only the admitted turn and applies incremental text', () => {
+  const old = { question: 'old', reply: 'keep me', status: 'completed' }
+  const initial = { id: 'thread', sessionId: 'main', version: 3, turns: [old] }
+  const pending = appendTurn(initial, { ...initial, version: 4, turnIndex: 1, turn: { question: 'new', reply: '', status: 'generating' } })
+  const prefix = applyReply(pending, 1, { version: 6, offset: 0, text: 'first', status: 'generating' })
+  const answer = applyReply(prefix, 1, { version: 9, offset: 5, text: ' second', status: 'completed', finishedAt: 123, usage: { outputTokens: 7 } })
+  assert.equal(answer.turns[0], old)
+  assert.equal(answer.turns[1].reply, 'first second')
+  assert.equal(answer.turns[1].finishedAt, 123)
+  assert.deepEqual(answer.turns[1].usage, { outputTokens: 7 })
+  assert.equal(applyReply(answer, 1, { version: 6, offset: 0, text: 'old delta', status: 'generating' }), answer)
+})
+
+test('wire keeps generation success separate from a failed archive write', () => {
+  const sessionId = 'session-'.repeat(40)
+  const detail = { id: 'thread', sessionId, version: 1, turns: [{ question: 'new', reply: 'answer', status: 'generating', createdAt: 1 }] }
+  const updated = applyReply(detail, 0, { version: 2, updatedAt: 2, offset: 6, text: '', status: 'completed', finishedAt: 2, saveError: 'write-failure' })
+  assert.equal(parseSessionId(sessionId), sessionId)
+  assert.deepEqual(parseTurn(updated.turns[0]), {
+    question: 'new', reply: 'answer', status: 'completed', createdAt: 1, finishedAt: 2, saveError: 'write-failure',
+  })
+  const longError = 'error '.repeat(100)
+  assert.equal(parseTurn({ ...updated.turns[0], status: 'failed', error: longError }).error, longError)
+})
+
+test('installed Cordis and Gateway let the real plugin caller resolve remote.btw', { timeout: 8000 }, async () => {
+  const fromDsh = name => import(pathToFileURL(createRequire(resolve(process.env.DSH_INSTALL_DIR, 'package.json')).resolve(name)).href)
+  const [{ Context }, { TypertRegistry }, gateway] = await Promise.all([
+    fromDsh('@deepseek-ai/cordis'), fromDsh('@deepseek-ai/dsh-typert-registry'), fromDsh('@deepseek-ai/dsh-api-gateway/client'),
+  ])
+  const ctx = new Context()
+  const capture = harness()
+  const calls = []
+  let source
+  const dispose = () => {}
+  const thread = 'btw-00000000-0000-0000-0000-000000000001'
+  ctx.provide('sidebarRight', capture.sidebarRight)
+  ctx.provide('sidebarRightTabs', { register: () => dispose })
+  ctx.provide('slots', { inject: (_, install) => install(), register: () => dispose })
+  ctx.provide('locale', { register: () => dispose, bind: () => key => key })
+  ctx.provide('inputTriggers', { registerSource: value => { source = value; return dispose } })
+  ctx.provide('connection', {
+    interactions: 'none',
+    rpc: {
+      open() { assert.fail('unexpected stream') },
+      async call(path, endpoint, payload) {
+        calls.push({ path, endpoint, args: { ...payload.args } })
+        return { ok: true, value: { id: thread } }
+      },
+    },
+  })
+  await ctx.plugin(TypertRegistry)
+  const gatewayFiber = ctx.plugin(gateway)
+  await gatewayFiber
+  const pluginFiber = ctx.plugin({ inject, apply: scope => mountClient(scope, {}) })
+  try {
+    await pluginFiber
+    assert.ok(source)
+    const { claim } = await source.matchEnter({ sessionId: 'main' }, '/btw test', new AbortController().signal, { attachments: 0 })
+    assert.equal((await claim.submit('test')).kind, 'success')
+    assert.deepEqual(calls, [{ path: '/api', endpoint: 'btw/create', args: { agentId: 'main', question: 'test' } }])
+  } finally {
+    await pluginFiber.dispose()
+    await gatewayFiber.dispose()
+  }
+})
