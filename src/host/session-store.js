@@ -17,7 +17,7 @@ async function listDirectory(directory) {
   }
 }
 
-export function sessionThreadStore(persistence, parseRecord) {
+export function sessionThreadStore(persistence, parseRecord, onMalformedRecord) {
   return {
     async open(sessionId, signal) {
       const snapshot = await persistence.stat(sessionId, { signal })
@@ -39,11 +39,39 @@ export function sessionThreadStore(persistence, parseRecord) {
         for (const entry of await listDirectory(directory)) {
           if (!entry.isFile() || !entry.name.endsWith('.json')) continue
           const file = join(directory, entry.name)
-          const envelope = JSON.parse(await readFile(file, { encoding: 'utf8', signal }))
+          let contents
+          try {
+            contents = await readFile(file, { encoding: 'utf8', signal })
+          } catch (error) {
+            if (error?.code !== 'EACCES' && error?.code !== 'EPERM') throw error
+            signal.throwIfAborted()
+            onMalformedRecord?.(file, `cannot read thread record (${error.code})`)
+            continue
+          }
+          let envelope
+          try {
+            envelope = JSON.parse(contents)
+          } catch {
+            onMalformedRecord?.(file, 'invalid JSON')
+            continue
+          }
+          if (typeof envelope?.schemaVersion !== 'number') {
+            onMalformedRecord?.(file, 'invalid archive envelope')
+            continue
+          }
           if (envelope.schemaVersion !== SCHEMA_VERSION) continue
-          const record = parseRecord(envelope.record)
+          let record
+          try {
+            record = parseRecord(envelope.record)
+          } catch {
+            onMalformedRecord?.(file, 'invalid thread record')
+            continue
+          }
           if (record.sessionId !== sessionId) continue
-          if (entry.name !== `${record.id}.json` || files.has(record.id)) throw new Error('Invalid BTW thread archive')
+          if (entry.name !== `${record.id}.json` || files.has(record.id)) {
+            onMalformedRecord?.(file, 'invalid or duplicate thread filename')
+            continue
+          }
           files.set(record.id, file)
           records.push(record)
         }

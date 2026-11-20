@@ -716,7 +716,9 @@ export default class BtwService extends TypertRemoteService {
   }
 
   async [Service.init]() {
-    const store = sessionThreadStore(this.ctx.sessionPersistence, record => threadSchema.parse(record))
+    const store = sessionThreadStore(this.ctx.sessionPersistence, record => threadSchema.parse(record), (file, reason) => {
+      this.ctx.logger?.warn('BTW ignored archive %s: %s', file, reason)
+    })
     const host = new BtwHost({ store, llm: this.ctx.llm, logger: this.ctx.logger })
     this.ctx.effect(() => () => host.close(), 'btw.close')
     this.ctx.on('llm/stream', (request, next) => {
