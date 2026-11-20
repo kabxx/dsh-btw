@@ -514,20 +514,18 @@ export function summarizeUsage(turns) {
   let cacheRead = 0;
   let cacheWrite = 0;
   let output = 0;
-  let totalOnly = 0;
+  let total = 0;
   for (const { usage, status } of turns) {
     if (!usage || isRunning(status)) continue;
-    uncached += usage.inputTokens ?? 0;
-    cacheRead += usage.cacheReadTokens ?? 0;
-    cacheWrite += usage.cacheWriteTokens ?? 0;
-    output += usage.outputTokens ?? 0;
-    if (usage.inputTokens === undefined && usage.cacheReadTokens === undefined &&
-        usage.cacheWriteTokens === undefined && usage.outputTokens === undefined) {
-      totalOnly += usage.totalTokens ?? 0;
-    }
+    const { inputTokens = 0, cacheReadTokens = 0, cacheWriteTokens = 0, outputTokens = 0, totalTokens } = usage;
+    uncached += inputTokens;
+    cacheRead += cacheReadTokens;
+    cacheWrite += cacheWriteTokens;
+    output += outputTokens;
+    total += totalTokens ?? (inputTokens + cacheReadTokens + cacheWriteTokens + outputTokens);
   }
   const prompt = uncached + cacheRead + cacheWrite;
-  return { uncached, cacheRead, cacheWrite, output, total: prompt + output + totalOnly,
+  return { uncached, cacheRead, cacheWrite, output, total,
     cacheRatio: prompt > 0 ? cacheRead / prompt : null };
 }
 

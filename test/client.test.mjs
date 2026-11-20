@@ -67,6 +67,19 @@ test('usage follows the main chat cache buckets and keeps genuinely unknown usag
   assert.equal(summarizeUsage([settled()]).total, 0)
 })
 
+test('usage prefers each reported total and falls back to available buckets', () => {
+  const reported = { status: 'completed', usage: { inputTokens: 10, outputTokens: 5, totalTokens: 115 } }
+  assert.deepEqual(summarizeUsage([reported]), {
+    uncached: 10, cacheRead: 0, cacheWrite: 0, output: 5, total: 115, cacheRatio: 0,
+  })
+  assert.deepEqual(summarizeUsage([
+    reported,
+    { status: 'completed', usage: { inputTokens: 10, cacheReadTokens: 5, cacheWriteTokens: 5, outputTokens: 3 } },
+    { status: 'completed', usage: { totalTokens: 2 } },
+    { status: 'generating', usage: { totalTokens: 1_000 } },
+  ]), { uncached: 20, cacheRead: 5, cacheWrite: 5, output: 8, total: 140, cacheRatio: 5 / 30 })
+})
+
 test('sidebar formats token counts and clocks like the host and renders the estimated context separately', () => {
   assert.equal(formatTokenCount(81_000), '81K')
   assert.equal(formatTokenCount(12_230), '12.2K')
