@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url'
 import BtwService, { BtwHost, threadSchema } from '../src/host/index.js'
 import { sessionThreadStore } from '../src/host/session-store.js'
 import { TYPERT } from '../src/host/typert.js'
-import { CONTEXT_OVERFLOW, TYPERT_REMOTE, applyThreadEvent, parseDetail } from '../src/shared/wire.js'
+import { CONTEXT_OVERFLOW, TYPERT_REMOTE, applyThreadEvent, parseDetail, threadDescriptor } from '../src/shared/wire.js'
 
 const dshPackage = process.env.DSH_INSTALL_DIR
   ? resolve(process.env.DSH_INSTALL_DIR, 'package.json')
@@ -640,6 +640,83 @@ test('BTW replays all eligible frozen text and prior turns without plugin size c
     assert.deepEqual(parseDetail(host.get(sessionId, record.id)).turns, record.turns)
     assert.equal(record.turns.length, 30)
     assert.equal(domain.saved.get(record.id).turns[0].reply, reply(1))
+  } finally {
+    await host.close()
+  }
+})
+
+test('output limit keeps a completed reply, reaches the sidebar, and survives reopening', { timeout: 10_000 }, async () => {
+  const store = memoryStore()
+  const llm = controlledModel()
+  const agent = makeAgent('session-output-limit')
+  const host = new BtwHost({ store, llm })
+  try {
+    const { id, sessionId } = await host.create(agent, 'first question')
+    const reply = terminal(host.watch(sessionId, id, undefined, () => {}))
+    const sidebar = host.watchThread(sessionId, id, () => {})
+    try {
+      const threadEvent = threadDescriptor.result.create()
+      let detail = threadEvent.parse((await sidebar.next()).value).detail
+      const call = await llm.waitForCount(1)
+      call.emit(text('partial but usable answer'))
+      call.emit(finish('max-tokens'))
+      const done = latest(await reply)
+      assert.equal(done.status, 'completed')
+      assert.equal(done.outputLimitReached, true)
+      assert.equal(done.reply, 'partial but usable answer')
+      while (latest(detail).status === 'generating') {
+        detail = applyThreadEvent(detail, threadEvent.parse((await sidebar.next()).value))
+      }
+      assert.deepEqual(latest(detail), done)
+    } finally { await sidebar.return() }
+
+    await host.close()
+    const reopened = new BtwHost({ store, llm })
+    try {
+      await reopened.prepare(sessionId, undefined, agent)
+      assert.equal(latest(reopened.get(sessionId, id)).outputLimitReached, true)
+      await reopened.followup(sessionId, id, 'continue')
+      const followup = await llm.waitForCount(2)
+      assert.match(allText(followup.options), /partial but usable answer/u)
+      const noText = terminal(reopened.watch(sessionId, id, undefined, () => {}))
+      followup.emit(finish('max-tokens'))
+      const limited = latest(await noText)
+      assert.equal(limited.reply, '')
+      assert.equal(limited.status, 'completed')
+      assert.equal(limited.outputLimitReached, true)
+      assert.equal(limited.error, undefined)
+      await reopened.followup(sessionId, id, 'continue again')
+      const continued = await llm.waitForCount(3)
+      const done = terminal(reopened.watch(sessionId, id, undefined, () => {}))
+      continued.emit(text('continued answer'))
+      continued.emit(finish())
+      assert.equal(latest(await done).outputLimitReached, undefined)
+    } finally { await reopened.close() }
+  } finally { await host.close() }
+})
+
+test('native reply failures expose only known codes and never provider diagnostics', async () => {
+  const host = new BtwHost({
+    store: memoryStore(),
+    llm: {
+      async *stream(options) {
+        const code = options.messages.at(-1).content[0].text.split('\n').at(-1)
+        const failure = { code, message: 'private provider diagnostic' }
+        if (code === 'AUTH') throw Object.assign(new Error(failure.message), { code })
+        yield { type: 'finish', reason: { kind: 'error', failure } }
+      },
+    },
+  })
+  const agent = makeAgent('session-native-failures')
+  try {
+    for (const code of ['AUTH', 'ACCOUNT_SIGNED_OUT', 'ACCOUNT_SIGN_IN_REQUIRED', 'QUOTA', 'ACCOUNT_QUOTA', 'PROVIDER_PRIVATE_CODE']) {
+      const { id, sessionId } = await host.create(agent, code)
+      const turn = latest(await terminal(host.watch(sessionId, id, undefined, () => {})))
+      assert.equal(turn.status, 'failed')
+      assert.equal(turn.error, code === 'PROVIDER_PRIVATE_CODE' ? '回复生成失败。' : code)
+      assert.equal(turn.outputLimitReached, undefined)
+      assert.doesNotMatch(JSON.stringify(turn), /private provider diagnostic/)
+    }
   } finally {
     await host.close()
   }

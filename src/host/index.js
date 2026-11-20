@@ -5,7 +5,7 @@ import { resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 import {
-  CONTEXT_OVERFLOW, PACKAGE_NAME, TOKEN_FIELDS, contextDescriptor, parseDetail, parseQuestion, parseSessionId, parseSubmissionId, parseThreadId, parseVersion, submitFollowupDescriptor, threadDescriptor,
+  CONTEXT_OVERFLOW, NATIVE_FAILURE_DETAILS, PACKAGE_NAME, TOKEN_FIELDS, contextDescriptor, parseDetail, parseQuestion, parseSessionId, parseSubmissionId, parseThreadId, parseVersion, submitFollowupDescriptor, threadDescriptor,
 } from '../shared/wire.js'
 import { sessionThreadStore } from './session-store.js'
 
@@ -103,6 +103,7 @@ const turnSchema = z.strictObject({
   finishedAt: timestamp.optional(),
   error: z.string().optional(),
   saveError: z.string().optional(),
+  outputLimitReached: z.literal(true).optional(),
   modelReply: nativeMessage.optional(),
   usage: z.strictObject(Object.fromEntries(TOKEN_FIELDS.map(key => [key, tokenCount.optional()]))).optional(),
   timing: z.strictObject({ requestMs: timestamp, firstTokenMs: timestamp.optional() }).optional(),
@@ -337,11 +338,12 @@ function readUsage(usage) {
 
 function replyDelta(previousText, turn) {
   const offset = previousText !== undefined && turn.reply.startsWith(previousText) ? previousText.length : 0
-  const { status, finishedAt, error, saveError, usage, timing } = publicTurn(turn)
+  const { status, finishedAt, error, saveError, outputLimitReached, usage, timing } = publicTurn(turn)
   return {
     offset, text: turn.reply.slice(offset), status,
     ...(finishedAt !== undefined && { finishedAt }), ...(error !== undefined && { error }),
     ...(saveError !== undefined && { saveError }), ...(usage !== undefined && { usage }),
+    ...(outputLimitReached !== undefined && { outputLimitReached }),
     ...(timing !== undefined && { timing }),
   }
 }
@@ -703,7 +705,7 @@ export class BtwHost {
         }
       }
     } catch (error) {
-      // Only the canonical overflow code crosses the wire, never provider details.
+      // Never expose raw provider diagnostics through side-question history.
       failureCode = error?.code
     }
     clearInterval(checkpointTimer)
@@ -721,8 +723,9 @@ export class BtwHost {
     let error
     if (interrupted) error = INTERRUPTION
     else if (failureCode === CONTEXT_WINDOW_EXCEEDED_CODE) error = CONTEXT_OVERFLOW
+    else if (typeof failureCode === 'string' && Object.hasOwn(NATIVE_FAILURE_DETAILS, failureCode)) error = failureCode
     else if (!finish || finish === 'error') error = FAILURE
-    else if (!turn.reply.trim()) error = NO_TEXT
+    else if (finish !== 'max-tokens' && !turn.reply.trim()) error = NO_TEXT
     let modelReply
     if (signal.aborted || !error) {
       try { modelReply = modelReplyFor(record, assembler, signal.aborted) } catch { error = FAILURE }
@@ -731,6 +734,7 @@ export class BtwHost {
     const terminal = withLatest(current, {
       ...turn,
       status: interrupted ? 'interrupted' : error ? 'failed' : 'completed',
+      ...(!interrupted && !error && finish === 'max-tokens' && { outputLimitReached: true }),
       finishedAt: time,
       ...(error ? { error } : {}),
       ...(modelReply ? { modelReply } : {}),

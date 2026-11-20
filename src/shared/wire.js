@@ -1,5 +1,12 @@
 export const PACKAGE_NAME = '@kabxx/dsh-btw'
 export const CONTEXT_OVERFLOW = 'context-window-exceeded'
+export const NATIVE_FAILURE_DETAILS = Object.freeze({
+  ACCOUNT_SIGNED_OUT: 'accountSignedOut',
+  ACCOUNT_SIGN_IN_REQUIRED: 'accountSignInRequired',
+  AUTH: 'invalidApiKey',
+  QUOTA: 'quotaExhausted',
+  ACCOUNT_QUOTA: 'quotaExhausted',
+})
 const STATUSES = new Set(['generating', 'completed', 'failed', 'interrupted'])
 export const TOKEN_FIELDS = ['inputTokens', 'outputTokens', 'totalTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens']
 const THREAD_ID = /^btw-[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/u
@@ -69,8 +76,12 @@ function parseTiming(value) {
   return checked({ requestMs, firstTokenMs }, firstTokenMs <= requestMs, 'first token timing')
 }
 
+function parseOutputLimit(value) {
+  return checked(value.outputLimitReached, value.outputLimitReached === true && value.status === 'completed', 'output limit')
+}
+
 export function parseTurn(value) {
-  object(value, ['question', 'reply', 'status', 'createdAt', 'finishedAt', 'error', 'saveError', 'usage', 'timing'])
+  object(value, ['question', 'reply', 'status', 'createdAt', 'finishedAt', 'error', 'saveError', 'outputLimitReached', 'usage', 'timing'])
   const turn = {
     question: parseQuestion(value.question),
     reply: checked(value.reply, typeof value.reply === 'string', 'reply'),
@@ -81,6 +92,7 @@ export function parseTurn(value) {
   else checked(value.finishedAt, value.finishedAt === undefined, 'finishedAt')
   if (value.error !== undefined) turn.error = checked(value.error, typeof value.error === 'string', 'error')
   if (value.saveError !== undefined) turn.saveError = checked(value.saveError, typeof value.saveError === 'string', 'saveError')
+  if (value.outputLimitReached !== undefined) turn.outputLimitReached = parseOutputLimit(value)
   if (value.usage !== undefined) turn.usage = parseUsage(value.usage)
   if (value.timing !== undefined) turn.timing = parseTiming(value.timing)
   return turn
@@ -127,6 +139,7 @@ export function applyReply(detail, turnIndex, update) {
     ...previous, reply: turn.reply.slice(0, update.offset) + update.text, status: update.status,
     ...(update.finishedAt !== undefined && { finishedAt: update.finishedAt }),
     ...(update.error !== undefined && { error: update.error }),
+    ...(update.outputLimitReached !== undefined && { outputLimitReached: update.outputLimitReached }),
     ...(update.saveError !== undefined && { saveError: update.saveError }),
     ...(update.usage !== undefined && { usage: update.usage }),
     ...(update.timing !== undefined && { timing: update.timing }),
@@ -142,7 +155,7 @@ function parseReceipt(value) {
   }
 }
 
-const replyFields = ['offset', 'text', 'status', 'finishedAt', 'error', 'saveError', 'usage', 'timing']
+const replyFields = ['offset', 'text', 'status', 'finishedAt', 'error', 'saveError', 'outputLimitReached', 'usage', 'timing']
 
 function parseReply(value) {
   const update = {
@@ -152,6 +165,7 @@ function parseReply(value) {
   if (update.status !== 'generating') update.finishedAt = timestamp(value.finishedAt)
   else checked(value.finishedAt, value.finishedAt === undefined, 'finishedAt')
   if (value.error !== undefined) update.error = checked(value.error, typeof value.error === 'string', 'error')
+  if (value.outputLimitReached !== undefined) update.outputLimitReached = parseOutputLimit(value)
   if (value.saveError !== undefined) update.saveError = checked(value.saveError, typeof value.saveError === 'string', 'saveError')
   if (value.usage !== undefined) update.usage = parseUsage(value.usage)
   if (value.timing !== undefined) update.timing = parseTiming(value.timing)

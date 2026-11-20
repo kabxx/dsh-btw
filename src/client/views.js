@@ -1,4 +1,4 @@
-import { CONTEXT_OVERFLOW, applyThreadEvent } from '../shared/wire.js';
+import { CONTEXT_OVERFLOW, NATIVE_FAILURE_DETAILS, applyThreadEvent } from '../shared/wire.js';
 
 // The containing DSH slots own column widths, the mobile sidebar shell, and focus outside BTW.
 export const styles = String.raw`
@@ -320,6 +320,36 @@ export const styles = String.raw`
 .dsh-btw-feedback { margin: 6px 8px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
 .dsh-btw-turn-feedback { margin: 3px 0 0; }
 .dsh-btw-failure { color: var(--dsw-alias-state-error-primary); }
+/* Match the status row and StateDot used by the native conversation. */
+.dsh-btw-reply-status {
+  --dsh-btw-reply-status-color: var(--dsw-alias-state-error-primary);
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  line-height: calc(20px + var(--dsh-content-font-delta-secondary, 0px));
+}
+.dsh-btw-reply-status[data-tone='warning'] { --dsh-btw-reply-status-color: var(--dsw-alias-state-warn-primary); }
+.dsh-btw-reply-status-dot {
+  position: relative;
+  width: 10px;
+  height: 10px;
+  margin-top: 5px;
+  color: var(--dsh-btw-reply-status-color);
+}
+.dsh-btw-reply-status-dot::after {
+  content: '';
+  position: absolute;
+  inset: 20%;
+  border-radius: 50%;
+  corner-shape: round;
+  background: currentColor;
+}
+.dsh-btw-reply-status-copy { min-width: 0; overflow-wrap: anywhere; }
+.dsh-btw-reply-status-title { color: var(--dsh-btw-reply-status-color); font-weight: 600; }
+.dsh-btw-reply-status-detail { color: var(--dsw-alias-label-secondary); margin-inline-start: 6px; }
 .dsh-btw-retry {
   margin-inline-start: 6px;
   padding: 2px 6px;
@@ -798,6 +828,14 @@ export function createViews(React) {
       text, onRetry && h('button', { type: 'button', className: 'dsh-btw-retry', onClick: onRetry }, t('retry')));
   }
 
+  function ReplyStatus({ title, detail, tone = 'error', id }) {
+    return h('div', { id, className: 'dsh-btw-reply-status', 'data-tone': tone, role: 'status' },
+      h('span', { className: 'dsh-btw-reply-status-dot', 'aria-hidden': true }),
+      h('div', { className: 'dsh-btw-reply-status-copy' },
+        h('span', { className: 'dsh-btw-reply-status-title' }, title),
+        detail && h('span', { className: 'dsh-btw-reply-status-detail' }, detail)));
+  }
+
   function Markdown({ text, running, renderFactorySlot }) {
     const fallback = h('div', { className: 'dsh-btw-plain' }, text);
     return renderFactorySlot?.('conversation.chat.reasoning.content', { text, running }, { fallback }) ?? fallback;
@@ -889,12 +927,18 @@ export function createViews(React) {
         h('span', null, t('waiting')));
     }
     const overflow = turn?.error === CONTEXT_OVERFLOW;
-    const failure = overflow ? 'contextOverflow' : state || (!text.trim() ? 'replyFailed' : '');
+    const outputLimit = turn?.outputLimitReached;
+    const failure = overflow ? 'contextOverflow' : turn?.error === 'ACCOUNT_SIGNED_OUT'
+      ? 'taskStopped' : state || (!text.trim() && !outputLimit ? 'replyFailed' : '');
+    const detailKey = overflow ? 'contextOverflowHint'
+      : Object.hasOwn(NATIVE_FAILURE_DETAILS, turn?.error) ? NATIVE_FAILURE_DETAILS[turn.error] : undefined;
     return h(Fragment, null,
       text && h(Markdown, { text, running, renderFactorySlot }),
-      failure && h(Feedback, { id: overflow ? overflowNotice : undefined,
-        text: t(failure), t, error: overflow || failure === 'replyFailed', inline: true }),
-      turn?.saveError && h(Feedback, { text: t('archiveWriteFailed'), t, error: true, inline: true }),
+      failure && h(ReplyStatus, { id: overflow ? overflowNotice : undefined,
+        title: t(failure), detail: detailKey ? t(detailKey) : undefined }),
+      outputLimit && h(ReplyStatus, { tone: 'warning', title: t('outputLimit'),
+        detail: t(inline ? 'outputLimitInlineHint' : 'outputLimitHint') }),
+      turn?.saveError && h(ReplyStatus, { title: t('archiveWriteFailed') }),
       !inline && !running && text && h(ReplyActions, { turn, t, language, performanceUsage }));
   }
 
@@ -1272,9 +1316,8 @@ export function createViews(React) {
 
     const composerOverflow = error === 'contextOverflow' && !overflowed;
     return h(Fragment, null,
-      error && (!overflowed || error !== 'contextOverflow') && h(Feedback, {
-        id: composerOverflow ? overflowNotice : undefined, text: t(error), t, error: true,
-      }),
+      composerOverflow && h(ReplyStatus, { id: overflowNotice, title: t('contextOverflow'), detail: t('contextOverflowHint') }),
+      error && error !== 'contextOverflow' && h(Feedback, { text: t(error), t, error: true }),
       !locked && micHelp && h('div', { className: 'dsh-btw-feedback' }, h('span', { role: 'status' }, t(micHelp)),
         micHelp === 'micSetup' && speechSettings && h('button', { type: 'button', className: 'dsh-btw-retry',
           onClick: speechSettings }, t('micSettings'))),
