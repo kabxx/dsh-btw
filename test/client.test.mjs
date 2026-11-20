@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { inject, makeController, makeSource, mountClient } from '../src/client/index.js'
+import { inject, makeController, makeSource, mountClient, observeSpeech } from '../src/client/index.js'
 import { appendTurn, applyReply, parseSessionId, parseTurn } from '../src/shared/wire.js'
 import { contextReading, formatMessageTime, formatTokenCount, orderHistory, summarizeUsage } from '../src/client/views.js'
 import zh from '../locale/zh.json' with { type: 'json' }
@@ -459,6 +459,69 @@ test('dictation takes duration, byte budget and selection from the DSH catalog p
   } finally {
     controller.dispose()
   }
+})
+
+test('speech readiness follows native reconnects and reopens an ended readiness stream', { timeout: 8000 }, async () => {
+  const fromDsh = createRequire(resolve(process.env.DSH_INSTALL_DIR, 'package.json'))
+  const { RemoteStream, RemoteStreamCarrierError } = await import(pathToFileURL(fromDsh.resolve('@deepseek-ai/dsh-api-gateway/client')).href)
+  const ctx = harness()
+  const controller = makeController(ctx)
+  const generation = snapshot({})
+  const disconnected = Promise.withResolvers()
+  const hostClosed = Promise.withResolvers()
+  const ready = (providerId, maxDurationSeconds) => ({
+    selection: { providerId }, maxDurationSeconds, maxAudioBytes: 10,
+    providers: [{ id: providerId, preparation: { phase: 'ready' } }],
+  })
+  const signals = []
+  const speech = {
+    async *follow(signal) {
+      signals.push(signal)
+      if (signals.length === 1) {
+        yield ready('before', 31)
+        await disconnected.promise
+        throw new RemoteStreamCarrierError('The test connection dropped')
+      }
+      if (signals.length === 2) {
+        yield ready('after', 73)
+        await hostClosed.promise
+        return
+      }
+      yield ready('reopened', 89)
+      if (!signal.aborted) await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))
+    },
+  }
+  const waitFor = predicate => new Promise(resolve => {
+    if (predicate()) { resolve(); return }
+    const stop = controller.subscribe(() => {
+      if (predicate()) { stop(); resolve() }
+    })
+  })
+  const stop = observeSpeech({ speech, $stream: options => new RemoteStream({ generation }, options) }, controller)
+  try {
+    await waitFor(() => controller.beginDictation()?.maxDurationSeconds === 31)
+    generation.set(undefined)
+    const fellOffline = waitFor(() => !controller.getSnapshot().dictationAvailable)
+    disconnected.resolve()
+    await fellOffline
+    assert.equal(controller.getSnapshot().speechMounted, true)
+    assert.equal(signals.length, 1)
+    const recovered = waitFor(() => controller.beginDictation()?.maxDurationSeconds === 73)
+    generation.set({})
+    await recovered
+    assert.equal(signals.length, 2)
+    const reopened = waitFor(() => controller.beginDictation()?.maxDurationSeconds === 89)
+    hostClosed.resolve()
+    await reopened
+    assert.equal(signals.length, 3)
+  } finally {
+    disconnected.resolve()
+    hostClosed.resolve()
+    await stop()
+    controller.dispose()
+  }
+  assert.ok(signals.every(signal => signal.aborted))
+  assert.equal(controller.getSnapshot().speechMounted, false)
 })
 
 test('dropping a UI subscription aborts only its own Remote stream', async () => {

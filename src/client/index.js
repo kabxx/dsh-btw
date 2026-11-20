@@ -375,6 +375,43 @@ export async function mountClient(ctx, React) {
   await ctx.inject(['remote', 'remote.btw'], scope => mountFeatures(scope, React))
 }
 
+export function observeSpeech(remote, controller) {
+  const speech = remote.speech
+  let disposed = false
+  const unavailable = () => {
+    if (!disposed) controller.setSpeechCatalog(undefined, speech)
+  }
+  unavailable()
+  const stream = remote.$stream({
+    name: 'BTW speech readiness',
+    open: signal => speech.follow(signal),
+    ended: accepted => {
+      unavailable()
+      // Readiness stays subscribed after an accepted baseline, including a clean Host stream close.
+      if (accepted) stream.restart()
+      return new Error('BTW speech readiness stream ended')
+    },
+    carrierFailed: unavailable,
+  })
+  const observing = (async () => {
+    try {
+      for await (const item of stream) {
+        if (disposed) break
+        controller.setSpeechCatalog(item.value, speech)
+        item.accept()
+      }
+    } catch {
+      unavailable()
+    }
+  })()
+  return async () => {
+    disposed = true
+    controller.setSpeechCatalog(undefined)
+    await stream.dispose()
+    await observing
+  }
+}
+
 function mountFeatures(ctx, React) {
   ctx.effect(() => ctx.locale.register(namespace, { en: en.ui, zh: zh.ui }))
   const t = ctx.locale.bind(namespace)
@@ -417,23 +454,6 @@ function mountFeatures(ctx, React) {
     })
   })
   ctx.inject(['remote.speech'], scope => {
-    scope.effect(() => {
-      const abort = new AbortController()
-      const speech = scope.remote.speech
-      controller.setSpeechCatalog(undefined, speech)
-      const stream = speech.follow(abort.signal)
-      void (async () => {
-        try {
-          for await (const catalog of stream) {
-            if (!abort.signal.aborted) controller.setSpeechCatalog(catalog, speech)
-          }
-        } catch { if (!abort.signal.aborted) controller.setSpeechCatalog(undefined, speech) }
-      })()
-      return () => {
-        abort.abort()
-        stream.dispose?.()
-        controller.setSpeechCatalog(undefined)
-      }
-    })
+    scope.effect(() => observeSpeech(scope.remote, controller))
   })
 }
