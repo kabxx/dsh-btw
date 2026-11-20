@@ -87,6 +87,7 @@ const nativeSnapshot = z.strictObject({
     updates: z.array(z.strictObject({ messageId: z.string(), additions: z.array(toolSchema) })),
   }).optional(),
   temperature: z.number().optional(),
+  maxTokens: z.number().optional(),
   stop: z.array(z.string()).optional(),
   measuredPrefix: tokenCount.optional(),
 })
@@ -196,7 +197,10 @@ function freezeSnapshot(session, selected, observed, tokenMeter) {
     observed.request.messages.every((message, index) => message === derived[index])
   const exact = matchesSurface && sameRoute(observed.request, selected) ? observed : undefined
   const header = session.requestHeader?.()
-  const controls = exact?.request ?? (sameRoute(header?.config, selected) ? header.config : selected)
+  const matchingHeader = sameRoute(header?.config, selected) ? header : undefined
+  const controls = exact?.request ?? matchingHeader?.config ?? selected
+  const usesAdapterDefault = exact ? exact.usesAdapterDefault : matchingHeader?.adapterDefaults?.maxTokens
+  const maxTokens = usesAdapterDefault ? undefined : controls.maxTokens
   const route = { ...selected, reasoningEffort: selected.reasoningEffort ?? controls.reasoningEffort }
   const messages = exact?.request.messages ?? derived.slice(0, end)
   const tools = exact ? exact.request.tools : header?.tools
@@ -221,6 +225,7 @@ function freezeSnapshot(session, selected, observed, tokenMeter) {
     tools,
     toolHistory,
     temperature: controls.temperature,
+    maxTokens,
     stop: controls.stop,
     measuredPrefix: Number.isSafeInteger(measuredPrefix) && measuredPrefix >= 0 ? measuredPrefix : undefined,
   }))
@@ -261,11 +266,11 @@ function requestMessages(record, includeSettledLastReply = false) {
 }
 
 function requestFields(snapshot) {
-  const { system, tools, toolHistory, temperature, stop } = snapshot
+  const { system, tools, toolHistory, temperature, maxTokens, stop } = snapshot
   return {
     ...(system !== undefined && { system }), ...(tools !== undefined && { tools }),
     ...(toolHistory !== undefined && { toolHistory }), ...(temperature !== undefined && { temperature }),
-    ...(stop !== undefined && { stop }),
+    ...(maxTokens !== undefined && { maxTokens }), ...(stop !== undefined && { stop }),
   }
 }
 
@@ -405,7 +410,11 @@ export class BtwHost {
   }
 
   observeMain(session, request) {
-    this.mainRequests.set(session, { request, anchor: session.surface?.nodes?.at(-1) ?? null })
+    const header = session.requestHeader?.()
+    const usesAdapterDefault = sameRoute(header?.config, request) &&
+      header.config.maxTokens === request.maxTokens && header.adapterDefaults?.maxTokens === true
+    const anchor = session.surface?.nodes?.at(-1) ?? null
+    this.mainRequests.set(session, { request, anchor, usesAdapterDefault })
   }
 
   async save(record) {

@@ -599,8 +599,9 @@ test('native Session anchor and installed DeepSeek thinking-mode request seriali
     const done = await terminal(host.watch(followup.sessionId, followup.id, undefined, () => {}))
     assert.equal(latest(done).status, 'completed')
     assert.equal(fetch.mock.callCount(), 2)
+    assert.equal(Object.hasOwn(domain.saved.get(record.id).snapshot, 'maxTokens'), false)
+    for (const call of fetch.mock.calls) assert.equal(JSON.parse(call.arguments[1].body).max_tokens, 8_192)
     const request = JSON.parse(fetch.mock.calls[1].arguments[1].body)
-    assert.equal(request.max_tokens, 8_192)
     assert.equal(request.thinking.type, 'enabled')
     assert.equal(request.output_config.effort, 'high')
     assert.equal(request.tools, undefined)
@@ -673,12 +674,14 @@ test('native Cordis/LLM waterfall freezes and reuses the main request across res
     msg('latest-user', 'user', 'main request currently waiting for answer'),
   ]
   agent.session.messages = [...messages]
+  const main = await ctx.llm.prepareCall({ ...agent.selected, temperature: 0.1, maxTokens: 16 }, signal)
+  agent.session.requestHeader = () => ({ config: main.config, adapterDefaults: main.adapterDefaults, tools: [tool] })
   const options = markAgentLoopRequest(Object.freeze({
-    ...agent.selected, temperature: 0.1, sessionId: agent.session.id, messages: Object.freeze([...messages]),
+    ...main.config, sessionId: agent.session.id, messages: Object.freeze([...messages]),
     tools: [tool], toolHistory: { tools: [tool], updates: [] }, signal,
   }))
   try {
-    for await (const chunk of ctx.llm.stream(options)) {
+    for await (const chunk of main.stream(options)) {
       if (chunk.type === 'finish') assert.equal(chunk.reason.kind, 'stop', JSON.stringify(chunk.reason))
     }
     assert.equal(requests.length, 1)
@@ -692,6 +695,7 @@ test('native Cordis/LLM waterfall freezes and reuses the main request across res
     const saved = await folder.read(id)
     assert.equal(saved.snapshot.mode, 'native')
     assert.equal(saved.snapshot.measuredPrefix, 8_700)
+    assert.equal(saved.snapshot.maxTokens, 16)
     assert.deepEqual(saved.snapshot.toolHistory, options.toolHistory)
     assert.deepEqual(saved.snapshot.messages, options.messages)
     assert.equal(Object.hasOwn(saved.snapshot, 'signal'), false)
@@ -708,8 +712,12 @@ test('native Cordis/LLM waterfall freezes and reuses the main request across res
     assert.deepEqual(sideRequest.body.tools, mainRequest.body.tools)
     assert.equal(sideRequest.body.system, mainRequest.body.system)
     assert.equal(sideRequest.body.temperature, mainRequest.body.temperature)
-    assert.equal(sideRequest.body.max_tokens, mainRequest.body.max_tokens)
+    assert.equal(mainRequest.body.max_tokens, 16)
+    assert.equal(sideRequest.body.max_tokens, 16)
     assert.match(sideRequest.body.messages.at(-1).content.at(-1).text, /Do not call tools[\s\S]*side question$/)
+    await host.followup(sessionId, id, 'same process question')
+    await terminal(host.watch(sessionId, id, undefined, () => {}))
+    assert.equal(requests[2].body.max_tokens, 16)
     agent.session.messages = [msg('later', 'user', 'new main surface')]
     const reopened = new BtwHost({ store: sessionThreadStore(ctx.sessionPersistence, record => threadSchema.parse(record)), llm: ctx.llm })
     try {
@@ -717,14 +725,45 @@ test('native Cordis/LLM waterfall freezes and reuses the main request across res
       await reopened.followup(sessionId, id, 'reopened question')
       const done = await terminal(reopened.watch(sessionId, id, undefined, () => {}))
       assert.equal(latest(done).status, 'completed')
-      assert.deepEqual(requests[2].body.messages.slice(0, -2), sideRequest.body.messages)
-      assert.doesNotMatch(JSON.stringify(requests[2]), /new main surface/)
+      assert.deepEqual(requests[3].body.messages.slice(0, -2), requests[2].body.messages)
+      assert.equal(requests[3].body.max_tokens, 16)
+      assert.doesNotMatch(JSON.stringify(requests[3]), /new main surface/)
     } finally {
       await reopened.close()
     }
   } finally {
     await fiber.dispose()
     disposeAdapter()
+  }
+})
+
+test('side requests preserve explicit limits and resolve adapter defaults for their own calls', { timeout: 10_000 }, async () => {
+  const llm = controlledModel()
+  const archive = memoryStore()
+  const host = new BtwHost({ store: archive, llm })
+  const cases = [
+    { label: 'matching header', options: { maxTokens: 16 }, expected: 16 },
+    { label: 'observed adapter default', options: { maxTokens: 8192 }, defaulted: true, observe: true },
+    { label: 'header adapter default', options: { maxTokens: 8192 }, defaulted: true },
+    { label: 'other model', options: { model: 'other-model', maxTokens: 16 } },
+  ]
+  try {
+    for (const [index, { label, options, defaulted, observe, expected }] of cases.entries()) {
+      const agent = makeAgent(`session-output-limit-${index}`)
+      const config = { ...agent.selected, ...options }
+      agent.session.requestHeader = () => ({ config, adapterDefaults: defaulted ? { maxTokens: true } : undefined })
+      if (observe) host.observeMain(agent.session, { ...config, messages: agent.session.messages })
+      const { id, sessionId } = await host.create(agent, label)
+      const call = await llm.waitForCount(index + 1)
+      assert.equal(call.options.maxTokens, expected, label)
+      assert.equal(Object.hasOwn(call.options, 'maxTokens'), expected !== undefined, label)
+      assert.equal(archive.saved.get(id).snapshot.maxTokens, expected, label)
+      call.emit(text('done'))
+      call.emit(finish())
+      await terminal(host.watch(sessionId, id, undefined, () => {}))
+    }
+  } finally {
+    await host.close()
   }
 })
 
