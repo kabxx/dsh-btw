@@ -139,6 +139,72 @@ test('switching sessions keeps each sidebar destination and respects explicit co
   }
 })
 
+test('unsent drafts stay with their session and thread until that draft is accepted', async () => {
+  const ctx = harness()
+  const controller = makeController(ctx)
+  const receipt = Promise.withResolvers()
+  const accepted = { turnIndex: 1 }
+  try {
+    controller.openDetail('main', 'first')
+    controller.setDraft('main', 'first', 'Draft A')
+    controller.navigate('main', null)
+    controller.navigate('main', 'second')
+    assert.equal(controller.getDraft('main', 'second').text, '')
+    controller.setDraft('main', 'second', 'Draft B')
+    ctx.mounted.set('other')
+    controller.setDraft('other', 'first', 'Draft C')
+    ctx.mounted.set('main')
+    controller.navigate('main', 'first')
+    assert.equal(controller.getDraft('main', 'first').text, 'Draft A')
+    assert.equal(controller.getDraft('main', 'second').text, 'Draft B')
+    assert.equal(controller.getDraft('other', 'first').text, 'Draft C')
+
+    let sends = 0
+    ctx.remote.btw.followup = (session, id, text) => {
+      assert.deepEqual([session, id, text], ['main', 'first', 'Draft A'])
+      sends += 1
+      return receipt.promise
+    }
+    const pending = controller.submitDraft('main', 'first')
+    assert.equal(controller.getDraft('main', 'first').saving, true)
+    await controller.submitDraft('main', 'first')
+    assert.equal(sends, 1)
+    ctx.mounted.set('other')
+    ctx.mounted.set('main')
+    controller.setDraft('main', 'first', 'New input while sending')
+    receipt.resolve({ ok: true, value: accepted })
+    await pending
+    assert.equal(controller.getDraft('main', 'first').text, 'New input while sending')
+    assert.equal(controller.getDraft('main', 'first').receipt, accepted)
+    assert.equal(controller.getDraft('main', 'first').saving, false)
+
+    const rejection = Promise.withResolvers()
+    ctx.remote.btw.followup = () => rejection.promise
+    const rejected = controller.submitDraft('main', 'first')
+    const checked = assert.rejects(rejected, /rejected/)
+    ctx.mounted.set('other')
+    rejection.resolve({ ok: false, error: { message: 'rejected' } })
+    await checked
+    ctx.mounted.set('main')
+    assert.equal(controller.getDraft('main', 'first').text, 'New input while sending')
+    assert.equal(controller.getDraft('main', 'first').error, 'sendFailed')
+    assert.equal(controller.getDraft('main', 'second').error, undefined)
+    ctx.remote.btw.followup = async () => ({ ok: true, value: { turnIndex: 2 } })
+    await controller.submitDraft('main', 'first')
+    assert.equal(controller.getDraft('main', 'first').text, '')
+    assert.equal(controller.getDraft('main', 'first').error, undefined)
+    assert.equal(controller.getDraft('main', 'second').text, 'Draft B')
+  } finally {
+    controller.dispose()
+  }
+  const reopened = makeController(ctx)
+  try {
+    assert.equal(reopened.getDraft('main', 'second').text, '')
+  } finally {
+    reopened.dispose()
+  }
+})
+
 test('exact command interception, text-only envelope and independent submit', async () => {
   const ctx = harness()
   const call = []

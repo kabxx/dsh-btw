@@ -10,6 +10,7 @@ const voiceBundle = '@deepseek-ai/dsh-experimental-voice-input-bundle'
 const defaultPerformanceUsage = 'detailed'
 const microphonePreference = 'dsh.voice-input.microphone'
 const cardPreferencePrefix = 'dsh.btw.card.'
+const emptyDraft = { text: '', revision: 0, saving: false }
 
 // The installed Voice Input client persists a raw { id, label } snapshot.
 // Read it when recording starts, so a settings change applies to the next click.
@@ -41,6 +42,8 @@ function base64(bytes) {
 export function makeController(ctx) {
   const sidebar = ctx.sidebarRight
   const listeners = new Set()
+  const draftListeners = new Set()
+  const drafts = new Map()
   const activeStreams = new Set()
   let snapshot = {
     cards: {}, pane: null, notice: {}, dictationAvailable: false, speechMounted: false,
@@ -177,12 +180,47 @@ export function makeController(ctx) {
     return () => controller.abort()
   }
 
+  function draftKey(sessionId, id) { return JSON.stringify([sessionId, id]) }
+
+  function getDraft(sessionId, id) { return drafts.get(draftKey(sessionId, id)) ?? emptyDraft }
+
+  function publishDraft(sessionId, id, value) {
+    if (disposed) return
+    drafts.set(draftKey(sessionId, id), value)
+    for (const listener of [...draftListeners]) listener()
+  }
+
   return {
     subscribe(listener) {
       listeners.add(listener)
       return () => listeners.delete(listener)
     },
     getSnapshot: () => snapshot,
+    subscribeDrafts(listener) {
+      draftListeners.add(listener)
+      return () => draftListeners.delete(listener)
+    },
+    getDraft,
+    setDraft(sessionId, id, text) {
+      const draft = getDraft(sessionId, id)
+      publishDraft(sessionId, id, { ...draft, text, revision: draft.revision + 1, error: undefined })
+    },
+    async submitDraft(sessionId, id) {
+      const draft = getDraft(sessionId, id)
+      if (disposed || draft.saving || !draft.text.trim()) return
+      publishDraft(sessionId, id, { ...draft, saving: true, error: undefined })
+      try {
+        const receipt = unwrap(await ctx.remote.btw.followup(sessionId, id, draft.text))
+        const current = getDraft(sessionId, id)
+        const remaining = current.revision === draft.revision
+          ? { text: '', revision: current.revision + 1 } : {}
+        publishDraft(sessionId, id, { ...current, ...remaining, saving: false, receipt })
+      } catch (error) {
+        const messageKey = error?.code === 'btw/context-overflow' ? 'contextOverflow' : 'sendFailed'
+        publishDraft(sessionId, id, { ...getDraft(sessionId, id), saving: false, error: messageKey })
+        throw error
+      }
+    },
     openList: id => open(id, null),
     openDetail: (sessionId, id) => open(sessionId, id),
     navigate(sessionId, id) {
@@ -269,6 +307,8 @@ export function makeController(ctx) {
       closeTabs(session)
       for (const controller of activeStreams) controller.abort()
       listeners.clear()
+      draftListeners.clear()
+      drafts.clear()
     },
   }
 }

@@ -1130,10 +1130,8 @@ export function createViews(React) {
   }
 
   function Composer({ controller, sessionId, id, t, busy, overflowed, overflowNotice,
-    dictationAvailable, speechMounted, speechSettings, onSent }) {
-    const [draft, setDraft] = useState('');
-    const [saving, setSaving] = useState(false);
-    const [error, setError] = useState('');
+    dictationAvailable, speechMounted, speechSettings, draftState }) {
+    const { text: draft, saving, error } = draftState;
     const [micHelp, setMicHelp] = useState('');
     const [retainedTranscript, setRetainedTranscript] = useState('');
     const input = useRef(null);
@@ -1141,8 +1139,6 @@ export function createViews(React) {
     const composing = useRef(false);
     const pendingTranscript = useRef(null);
     const selectionAfterInsert = useRef(null);
-    const draftRevision = useRef(0);
-    const submitting = useRef(false);
     const live = useRef(false);
     const inputId = useId();
     useEffect(() => {
@@ -1157,7 +1153,7 @@ export function createViews(React) {
         pendingTranscript.current = { text, selection };
         return;
       }
-      if (selection.revision !== draftRevision.current) {
+      if (selection.revision !== controller.getDraft(sessionId, id).revision) {
         setRetainedTranscript(text);
         return;
       }
@@ -1169,8 +1165,7 @@ export function createViews(React) {
         return;
       }
       selectionAfterInsert.current = cursor;
-      draftRevision.current += 1;
-      setDraft(next);
+      controller.setDraft(sessionId, id, next);
     }
 
     const canRecord = typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices?.getUserMedia) &&
@@ -1213,28 +1208,10 @@ export function createViews(React) {
       return () => observer.disconnect();
     }, [resize]);
 
-    async function submit(event) {
+    function submit(event) {
       event.preventDefault();
-      if (sendBlocked || submitting.current || composing.current) return;
-      const revision = draftRevision.current;
-      submitting.current = true;
-      setSaving(true);
-      setError('');
-      try {
-        const detail = await controller.call('followup', sessionId, id, draft);
-        if (!live.current) return;
-        if (draftRevision.current === revision) {
-          draftRevision.current += 1;
-          setDraft('');
-        }
-        onSent(detail);
-      } catch (failure) {
-        if (live.current) setError(failure?.code === 'btw/context-overflow' ? 'contextOverflow' : 'sendFailed');
-      }
-      finally {
-        submitting.current = false;
-        if (live.current) setSaving(false);
-      }
+      if (sendBlocked || composing.current) return;
+      void controller.submitDraft(sessionId, id).catch(() => {});
     }
 
     function keyDown(event) {
@@ -1266,7 +1243,7 @@ export function createViews(React) {
       const node = input.current;
       if (node) {
         setRetainedTranscript('');
-        void dictation.toggle({ start: node.selectionStart, end: node.selectionEnd, revision: draftRevision.current });
+        void dictation.toggle({ start: node.selectionStart, end: node.selectionEnd, revision: controller.getDraft(sessionId, id).revision });
       }
     }
 
@@ -1283,7 +1260,7 @@ export function createViews(React) {
         h('button', { type: 'button', className: 'dsh-btw-retry', onClick: () => {
           const node = input.current;
           if (!node) return;
-          insertSpeech(retainedTranscript, { start: node.selectionStart, end: node.selectionEnd, revision: draftRevision.current });
+          insertSpeech(retainedTranscript, { start: node.selectionStart, end: node.selectionEnd, revision: controller.getDraft(sessionId, id).revision });
           setRetainedTranscript('');
         } }, t('micInsert'))),
       !locked && dictation.phase && h(Feedback, { text: t(dictation.phase), t,
@@ -1294,7 +1271,7 @@ export function createViews(React) {
         h('textarea', {
           id: inputId, ref: input, className: 'dsh-btw-input', rows: 1, placeholder: t('placeholder'), value: draft,
           disabled: locked,
-          onChange: event => { draftRevision.current += 1; setDraft(event.target.value); if (error) setError(''); },
+          onChange: event => controller.setDraft(sessionId, id, event.target.value),
           onKeyDown: keyDown, onCompositionStart: () => { composing.current = true; }, onCompositionEnd: finishComposition,
         }),
         h('div', { className: 'dsh-btw-form-actions' },
@@ -1428,9 +1405,20 @@ export function createViews(React) {
     const [revision, setRevision] = useState(0);
     const reload = () => setRevision(value => value + 1);
     const { detail, context, failure, accept } = useDetail({ controller, sessionId, id, revision, reload });
+    const readDraft = useCallback(() => controller.getDraft(sessionId, id), [controller, sessionId, id]);
+    const draftState = useSyncExternalStore(controller.subscribeDrafts, readDraft, readDraft);
+    const appliedReceipt = useRef(null);
     const heading = useRef(null);
     const scroll = useRef(null);
     const follow = useRef(true);
+    useEffect(() => {
+      const { receipt } = draftState;
+      if (!receipt || !detail || appliedReceipt.current === receipt) return;
+      appliedReceipt.current = receipt;
+      if (receipt.turnIndex < detail.turns.length) return;
+      follow.current = true;
+      accept(receipt);
+    }, [draftState.receipt, detail, accept]);
     useLayoutEffect(() => { if (focusHeading) heading.current?.focus({ preventScroll: true }); }, [focusHeading]);
     const question = detail?.question ?? t('title');
     const last = detail?.turns.at(-1);
@@ -1445,9 +1433,9 @@ export function createViews(React) {
         h(Thread, { detail, renderFactorySlot, t, language, scrollRef: scroll, followRef: follow, performanceUsage,
           streamFailed: failure === 'streamFailed', overflowNotice }),
         h('div', { className: 'dsh-btw-reply-dock' },
-          h(Composer, { controller, sessionId, id, t, busy: isRunning(last?.status), overflowed, overflowNotice,
-            dictationAvailable, speechMounted, speechSettings,
-            onSent: receipt => { follow.current = true; accept(receipt); } }),
+          h(Composer, { controller, sessionId, id, t,
+            busy: isRunning(last?.status) || (draftState.receipt?.turnIndex ?? -1) >= detail.turns.length,
+            overflowed, overflowNotice, dictationAvailable, speechMounted, speechSettings, draftState }),
           h(UsageAudit, { turns: detail.turns, contextSample: context, performanceUsage, t, language }))));
   }
 
