@@ -883,7 +883,7 @@ export function createViews(React) {
           h(IconButton, { icon: expanded ? 'up' : 'down', label: t(expanded ? 'collapse' : 'expand'), 'aria-expanded': expanded,
             'aria-controls': contentId, onClick: () => setExpanded(value => !value) }),
           h(IconButton, { icon: 'open', label: t('openSidebar'), onClick: () => {
-            try { setSidebarFailed(controller.openDetail(sessionId, id) === false); }
+            try { setSidebarFailed(!controller.moveCardToSidebar(sessionId, id)); }
             catch { setSidebarFailed(true); }
           } }),
           h(IconButton, { icon: 'close', label: t('dismiss'), onClick: () => controller.dismiss(sessionId) }))),
@@ -1401,7 +1401,7 @@ export function createViews(React) {
         ] }));
   }
 
-  function Chat({ controller, sessionId, id, t, renderFactorySlot, language, dictationAvailable, speechMounted, speechSettings, performanceUsage, focusHeading, onBack }) {
+  function Chat({ controller, sessionId, id, t, renderFactorySlot, language, dictationAvailable, speechMounted, speechSettings, performanceUsage, pane, onBack }) {
     const [revision, setRevision] = useState(0);
     const reload = () => setRevision(value => value + 1);
     const { detail, context, failure, accept } = useDetail({ controller, sessionId, id, revision, reload });
@@ -1419,7 +1419,7 @@ export function createViews(React) {
       follow.current = true;
       accept(receipt);
     }, [draftState.receipt, detail, accept]);
-    useLayoutEffect(() => { if (focusHeading) heading.current?.focus({ preventScroll: true }); }, [focusHeading]);
+    useLayoutEffect(() => { if (!pane.restored) heading.current?.focus({ preventScroll: true }); }, [pane]);
     const question = detail?.question ?? t('title');
     const last = detail?.turns.at(-1);
     const overflowed = last?.error === CONTEXT_OVERFLOW;
@@ -1445,7 +1445,7 @@ export function createViews(React) {
     return h('section', { className: 'dsh-btw-pane', 'aria-label': t('title'), lang: language },
       h('style', null, styles),
       id ? h(Chat, {
-        key: id, controller, sessionId, id, focusHeading: !pane.restored,
+        key: id, controller, sessionId, id, pane,
         t, renderFactorySlot, language, dictationAvailable, speechMounted, speechSettings, performanceUsage,
         onBack: () => { focusId.current = id; controller.navigate(sessionId, null); },
       }) : h(List, { key: pane.listOpenedAt, controller, sessionId, t, language, focusId: focusId.current, listRevision }));

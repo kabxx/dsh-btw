@@ -29,13 +29,16 @@ function harness() {
   })))
   const openTabs = snapshot(inventory())
   const expanded = new Map()
+  const activeKinds = new Map()
   const sidebarRight = {
     mounted, openTabs,
     tabsIn: id => tabs.get(id) ?? [],
+    active: () => sidebarRight.tabsIn(mounted.getSnapshot()).find(tab => tab.kind === activeKinds.get(mounted.getSnapshot())),
     isExpanded: () => expanded.get(mounted.getSnapshot()) ?? false,
     toggleExpanded: () => expanded.set(mounted.getSnapshot(), !sidebarRight.isExpanded()),
     openTabIn(id, kind) {
       expanded.set(id, true)
+      activeKinds.set(id, kind)
       if (sidebarRight.tabsIn(id).some(tab => tab.kind === kind)) return
       tabs.set(id, [...sidebarRight.tabsIn(id), { id: kind, kind }])
       openTabs.set(inventory())
@@ -341,7 +344,38 @@ test('a card stays until dismissed or replaced by a newer accepted side question
   }
 })
 
-test('a card restores on return and page reopen until explicitly dismissed, without restoring the sidebar on refresh', async () => {
+test('moving a card to the sidebar only dismisses it once the side question is visible', async () => {
+  const ctx = harness()
+  const { sidebarRight } = ctx
+  const controller = makeController(ctx)
+  const create = id => ({ ok: true, value: { id, sessionId: 'main', turns: [{ status: 'generating' }] } })
+  try {
+    await flush()
+    ctx.remote.btw.create = async () => create('first')
+    await controller.createCard('main', 'first')
+    assert.equal(controller.openList('main'), true)
+    sidebarRight.toggleExpanded()
+
+    const open = sidebarRight.openTabIn
+    sidebarRight.openTabIn = () => {}
+    assert.equal(controller.moveCardToSidebar('main', 'first'), false)
+    assert.equal(controller.getSnapshot().cards.main.id, 'first')
+    assert.equal(controller.getSnapshot().pane.id, null)
+
+    sidebarRight.openTabIn = open
+    assert.equal(controller.moveCardToSidebar('main', 'stale'), false)
+    assert.equal(controller.getSnapshot().cards.main.id, 'first')
+    assert.equal(controller.moveCardToSidebar('main', 'first'), true)
+    assert.equal(sidebarRight.isExpanded(), true)
+    assert.deepEqual(controller.getSnapshot().pane, { sessionId: 'main', id: 'first' })
+    assert.deepEqual(controller.getSnapshot().cards, {})
+    assert.equal(controller.moveCardToSidebar('main', 'first'), false)
+  } finally {
+    controller.dispose()
+  }
+})
+
+test('a card restores on return and page reopen until dismissed or moved to the sidebar', async () => {
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
   const preferences = new Map()
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
@@ -385,12 +419,15 @@ test('a card restores on return and page reopen until explicitly dismissed, with
     assert.deepEqual(ctx.sidebarRight.tabsIn('main'), [ctx.files])
     assert.equal(reopened.getSnapshot().pane, null)
     assert.deepEqual(reopened.getSnapshot().cards.main, crashed)
-    reopened.dismiss('main')
+    assert.equal(reopened.moveCardToSidebar('main', 'finished'), true)
+    ctx.sidebarRight.closeIn('main', 'kabxx-btw')
+    await reopened.restoreCard('main')
+    assert.deepEqual(reopened.getSnapshot().cards, {})
     reopened.dispose()
 
-    const afterDismiss = start()
-    await afterDismiss.restoreCard('main')
-    assert.deepEqual(afterDismiss.getSnapshot().cards, {})
+    const afterMove = start()
+    await afterMove.restoreCard('main')
+    assert.deepEqual(afterMove.getSnapshot().cards, {})
   } finally {
     for (const controller of controllers) controller.dispose()
     if (descriptor) Object.defineProperty(globalThis, 'localStorage', descriptor)

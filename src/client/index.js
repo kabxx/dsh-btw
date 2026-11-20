@@ -97,7 +97,7 @@ export function makeController(ctx) {
   function open(sessionId, id) {
     if (disposed || session !== sessionId) return false
     sidebar.openTabIn(sessionId, tabKind)
-    if (!sidebar.tabsIn(sessionId).some(tab => tab.kind === tabKind)) return false
+    if (disposed || session !== sessionId || !sidebar.isExpanded() || sidebar.active()?.kind !== tabKind) return false
     navigatePane(sessionId, id)
     return true
   }
@@ -118,6 +118,13 @@ export function makeController(ctx) {
       if (id === null) globalThis.localStorage?.removeItem(cardPreferencePrefix + sessionId)
       else globalThis.localStorage?.setItem(cardPreferencePrefix + sessionId, id)
     } catch { /* The current page can still remember the card in memory. */ }
+  }
+
+  function dismissCard(id) {
+    rememberCard(id, null)
+    const cards = { ...snapshot.cards }
+    delete cards[id]
+    publish({ cards })
   }
 
   async function restoreCard(sessionId) {
@@ -223,16 +230,16 @@ export function makeController(ctx) {
     },
     openList: id => open(id, null),
     openDetail: (sessionId, id) => open(sessionId, id),
+    moveCardToSidebar(sessionId, id) {
+      if (snapshot.cards[sessionId]?.id !== id || !open(sessionId, id)) return false
+      if (snapshot.cards[sessionId]?.id === id) dismissCard(sessionId)
+      return true
+    },
     navigate(sessionId, id) {
       if (!disposed && session === sessionId && panes.has(sessionId)) navigatePane(sessionId, id)
     },
     restoreCard,
-    dismiss(id) {
-      rememberCard(id, null)
-      const cards = { ...snapshot.cards }
-      delete cards[id]
-      publish({ cards })
-    },
+    dismiss: dismissCard,
     async createCard(id, question) {
       const request = ++lastCardRequest
       const detail = unwrap(await ctx.remote.btw.create(id, question))
