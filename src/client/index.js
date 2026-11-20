@@ -45,6 +45,7 @@ export function makeController(ctx) {
   const draftListeners = new Set()
   const drafts = new Map()
   const activeStreams = new Set()
+  const threadStreams = new Set()
   let snapshot = {
     cards: {}, pane: null, notice: {}, dictationAvailable: false, speechMounted: false,
     speechSettings: null, listRevision: 0, performanceUsage: defaultPerformanceUsage,
@@ -208,6 +209,10 @@ export function makeController(ctx) {
       return () => draftListeners.delete(listener)
     },
     getDraft,
+    clearGeneratingNotice(sessionId, id) {
+      const draft = getDraft(sessionId, id)
+      if (draft.error === 'stillGenerating') publishDraft(sessionId, id, { ...draft, error: undefined })
+    },
     setDraft(sessionId, id, text) {
       const draft = getDraft(sessionId, id)
       publishDraft(sessionId, id, { ...draft, text, revision: draft.revision + 1, error: undefined })
@@ -223,7 +228,8 @@ export function makeController(ctx) {
           ? { text: '', revision: current.revision + 1 } : {}
         publishDraft(sessionId, id, { ...current, ...remaining, saving: false, receipt })
       } catch (error) {
-        const messageKey = error?.code === 'btw/context-overflow' ? 'contextOverflow' : 'sendFailed'
+        const messageKey = error?.code === 'btw/context-overflow' ? 'contextOverflow'
+          : error?.code === 'btw/generating' ? 'stillGenerating' : 'sendFailed'
         publishDraft(sessionId, id, { ...getDraft(sessionId, id), saving: false, error: messageKey })
         throw error
       }
@@ -258,9 +264,32 @@ export function makeController(ctx) {
       return observe(signal => ctx.remote.btw.watch(sessionId, id, null, signal),
         detail => detail.turns.at(-1)?.status !== 'generating', onNext, onError)
     },
-    watchReply(sessionId, id, turnIndex, version, onNext, onError) {
-      return observe(signal => ctx.remote.btw.watchReply(sessionId, id, turnIndex, version, signal),
-        update => update.status !== 'generating', onNext, onError)
+    watchThread(sessionId, id, onNext, onError) {
+      const stream = ctx.remote.$stream({
+        name: 'BTW thread',
+        open: signal => ctx.remote.btw.watchThread(sessionId, id, signal),
+        ended: () => new Error('BTW thread stream ended'),
+        carrierFailed: onError,
+      })
+      let stopped = false
+      threadStreams.add(stream)
+      void (async () => {
+        try {
+          for await (const item of stream) {
+            if (stream.signal.aborted) return
+            onNext(item.value)
+            item.accept()
+          }
+        } catch (error) {
+          if (!stopped && !disposed) onError(error)
+        } finally {
+          threadStreams.delete(stream)
+        }
+      })()
+      return () => {
+        stopped = true
+        void stream.dispose()
+      }
     },
     pruneRestored,
     setPerformanceUsage(value) {
@@ -313,6 +342,7 @@ export function makeController(ctx) {
       disposeInventory()
       closeTabs(session)
       for (const controller of activeStreams) controller.abort()
+      for (const stream of threadStreams) void stream.dispose()
       listeners.clear()
       draftListeners.clear()
       drafts.clear()

@@ -38,6 +38,7 @@
     "input": "Enter a message",
     "send": "Send follow-up",
     "sendFailed": "Failed to send follow-up.",
+    "stillGenerating": "The previous reply is still generating.",
     "micStart": "Start recording",
     "micStop": "Stop and transcribe",
     "micRequesting": "Allow microphone access…",

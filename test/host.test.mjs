@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url'
 import BtwService, { BtwHost, threadSchema } from '../src/host/index.js'
 import { sessionThreadStore } from '../src/host/session-store.js'
 import { TYPERT } from '../src/host/typert.js'
-import { CONTEXT_OVERFLOW, TYPERT_REMOTE, parseDetail } from '../src/shared/wire.js'
+import { CONTEXT_OVERFLOW, TYPERT_REMOTE, applyThreadEvent, parseDetail } from '../src/shared/wire.js'
 
 const dshPackage = process.env.DSH_INSTALL_DIR
   ? resolve(process.env.DSH_INSTALL_DIR, 'package.json')
@@ -222,7 +222,7 @@ test('installed DSH strict Gateway lookup, owner authorization and business APIs
   const guest = { ...peer, id: 'guest-fixture', principal: { kind: 'guest' } }
   const invoke = (method, args, caller = peer, signal) => ctx.typertGateway.invoke({ namespace: 'btw', method, args, peer: caller, signal })
   try {
-    assert.deepEqual([...TYPERT.invocations, ctx.typert.local.get('btw/contextCapacity')], TYPERT_REMOTE.descriptors)
+    assert.deepEqual([...TYPERT.invocations, ctx.typert.local.get('btw/contextCapacity'), ctx.typert.local.get('btw/watchThread')], TYPERT_REMOTE.descriptors)
     await assert.rejects(invoke('list', { agentId: 'session-A' }, guest), error => error.code === 'remote-access/denied')
     assert.equal(lookups, 0, 'non-owner was refused before the session lookup')
     await assert.rejects(invoke('list', { agentId: 'session-missing' }))
@@ -312,7 +312,30 @@ test('installed DSH strict Gateway lookup, owner authorization and business APIs
 
     agentA.session.messages.push(msg('m4', 'user', 'NEW MAIN text'))
     agentA.selected.model = 'new-model'
-    const followup = await invoke('followup', { agentId: 'session-A', id: first.id, question: 'continue here' })
+    const tabA = new AbortController()
+    const tabB = new AbortController()
+    const otherPeer = { ...peer, id: 'owner-second-tab' }
+    const subscribe = async (caller, signal) => (await ctx.typertGateway.stream({
+      namespace: 'btw', method: 'watchThread', args: detailArgs, peer: caller, signal,
+    }))[Symbol.asyncIterator]()
+    const tabAStream = await subscribe(peer, tabA.signal)
+    const tabBStream = await subscribe(otherPeer, tabB.signal)
+    let tabADetail = applyThreadEvent(undefined, (await tabAStream.next()).value)
+    let tabBDetail = applyThreadEvent(undefined, (await tabBStream.next()).value)
+    assert.deepEqual(tabADetail, completed)
+    assert.deepEqual(tabBDetail, completed)
+    const firstUpdateInA = tabAStream.next()
+    const firstUpdateInB = tabBStream.next()
+    const followup = await invoke('followup', { ...detailArgs, question: 'continue here' }, otherPeer)
+    const admitted = (await firstUpdateInA).value
+    tabADetail = applyThreadEvent(tabADetail, admitted)
+    tabBDetail = applyThreadEvent(tabBDetail, (await firstUpdateInB).value)
+    assert.deepEqual(tabADetail, tabBDetail)
+    assert.equal(admitted.kind, 'change')
+    assert.equal(admitted.firstTurn, 1)
+    assert.deepEqual(admitted.turns, [followup.turn])
+    assert.equal(latest(tabADetail).status, 'generating')
+    await assert.rejects(invoke('followup', { ...detailArgs, question: 'too soon from another tab' }), error => error.code === 'btw/generating')
     assert.equal(followup.turnIndex, 1)
     assert.equal(followup.turn.question, 'continue here')
     assert.equal(Object.hasOwn(followup, 'turns'), false)
@@ -327,7 +350,9 @@ test('installed DSH strict Gateway lookup, owner authorization and business APIs
     // A first piece of output may arrive before the browser opens the second-turn stream.
     const secondWatch = await watch(followup.version)
     const started = secondWatch.next()
+    const prefixInA = tabAStream.next()
     secondCall.emit(text('可以'))
+    tabADetail = applyThreadEvent(tabADetail, (await prefixInA).value)
     assert.equal(latest((await started).value).reply, '可以')
     await secondWatch.return()
     const reader2 = await sidebar(followup.version)
@@ -335,10 +360,17 @@ test('installed DSH strict Gateway lookup, owner authorization and business APIs
     assert.deepEqual({ text: prefix.text, offset: prefix.offset, status: prefix.status }, { text: '可以', offset: 0, status: 'generating' })
     assert.equal(Object.hasOwn(prefix, 'turns'), false)
     const deltaPending = reader2.next()
+    const deltaInA = tabAStream.next()
     secondCall.emit(text('复用'))
+    const suffixInA = (await deltaInA).value
+    assert.equal(suffixInA.reply.offset, 2)
+    assert.equal(suffixInA.reply.text, '复用')
+    assert.deepEqual(suffixInA.turns, [])
+    tabADetail = applyThreadEvent(tabADetail, suffixInA)
     const delta = (await deltaPending).value
     assert.deepEqual({ text: delta.text, offset: delta.offset, status: delta.status }, { text: '复用', offset: 2, status: 'generating' })
     const terminalPending = reader2.next()
+    const terminalInA = tabAStream.next()
     secondCall.emit({ type: 'usage', usage: { inputTokens: 3, outputTokens: 2, cacheReadTokens: 4 } })
     secondCall.emit(finish())
     const done = (await terminalPending).value
@@ -349,6 +381,13 @@ test('installed DSH strict Gateway lookup, owner authorization and business APIs
     assert.deepEqual(latest((await folder.read(first.id))).timing, done.timing)
     assert.equal((await reader2.next()).done, true)
     const detail = await invoke('get', detailArgs)
+    tabADetail = applyThreadEvent(tabADetail, (await terminalInA).value)
+    tabBDetail = applyThreadEvent(tabBDetail, (await tabBStream.next()).value)
+    assert.deepEqual(tabADetail, detail)
+    assert.deepEqual(tabBDetail, detail, 'a delayed reader catches up without resending old turns')
+    tabA.abort()
+    tabB.abort()
+    await Promise.all([tabAStream.return(), tabBStream.return()])
     assert.deepEqual(detail.turns.map(turn => turn.reply), ['visible text', '可以复用'])
     assert.deepEqual(parseDetail(detail), detail)
     const followupContext = await invoke('contextCapacity', detailArgs)

@@ -4,7 +4,7 @@ import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { inject, makeController, makeSource, mountClient, observeSpeech } from '../src/client/index.js'
-import { appendTurn, applyReply, parseSessionId, parseTurn } from '../src/shared/wire.js'
+import { applyThreadEvent, applyReply, parseSessionId, parseTurn } from '../src/shared/wire.js'
 import { contextReading, createCompositionGuard, formatMessageTime, formatTokenCount, orderHistory, summarizeUsage } from '../src/client/views.js'
 import zh from '../locale/zh.json' with { type: 'json' }
 import en from '../locale/en.json' with { type: 'json' }
@@ -236,6 +236,24 @@ test('unsent drafts stay with their session and thread until that draft is accep
     assert.equal(reopened.getDraft('main', 'second').text, '')
   } finally {
     reopened.dispose()
+  }
+})
+
+test('a competing follow-up retains the draft and reports that the reply is generating', async () => {
+  const ctx = harness()
+  const controller = makeController(ctx)
+  ctx.remote.btw.followup = async () => ({ ok: false, error: { code: 'btw/generating', message: 'Host rejection' } })
+  try {
+    controller.setDraft('main', 'thread', 'still unsent')
+    await assert.rejects(controller.submitDraft('main', 'thread'), { code: 'btw/generating' })
+    assert.equal(controller.getDraft('main', 'thread').text, 'still unsent')
+    assert.equal(controller.getDraft('main', 'thread').error, 'stillGenerating')
+    assert.equal(controller.getDraft('main', 'thread').saving, false)
+    controller.clearGeneratingNotice('main', 'thread')
+    assert.equal(controller.getDraft('main', 'thread').error, undefined)
+    assert.equal(controller.getDraft('main', 'thread').text, 'still unsent')
+  } finally {
+    controller.dispose()
   }
 })
 
@@ -592,6 +610,47 @@ test('speech readiness follows native reconnects and reopens an ended readiness 
   assert.equal(controller.getSnapshot().speechMounted, false)
 })
 
+test('a sidebar thread reopens with current history after a native carrier loss', { timeout: 8000 }, async () => {
+  const fromDsh = createRequire(resolve(process.env.DSH_INSTALL_DIR, 'package.json'))
+  const { RemoteStream, RemoteStreamCarrierError } = await import(pathToFileURL(fromDsh.resolve('@deepseek-ai/dsh-api-gateway/client')).href)
+  const ctx = harness()
+  const generation = snapshot({})
+  const disconnect = Promise.withResolvers()
+  const first = Promise.withResolvers()
+  const offline = Promise.withResolvers()
+  const second = Promise.withResolvers()
+  const signals = []
+  ctx.remote.$stream = options => new RemoteStream({ generation }, options)
+  ctx.remote.btw.watchThread = async function* (_session, _id, signal) {
+    signals.push(signal)
+    yield { kind: 'snapshot', detail: { version: signals.length } }
+    if (signals.length === 1) {
+      await disconnect.promise
+      throw new RemoteStreamCarrierError('The test connection dropped')
+    }
+    if (!signal.aborted) await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))
+  }
+  const controller = makeController(ctx)
+  const stop = controller.watchThread('main', 'thread', event => {
+    if (event.detail.version === 1) first.resolve(event)
+    else second.resolve(event)
+  }, offline.resolve)
+  try {
+    assert.equal((await first.promise).kind, 'snapshot')
+    generation.set(undefined)
+    disconnect.resolve()
+    assert.match((await offline.promise).message, /connection dropped/)
+    assert.equal(signals.length, 1)
+    generation.set({})
+    assert.equal((await second.promise).detail.version, 2)
+  } finally {
+    disconnect.resolve()
+    stop()
+    controller.dispose()
+  }
+  assert.ok(signals.every(signal => signal.aborted))
+})
+
 test('dropping a UI subscription aborts only its own Remote stream', async () => {
   const ctx = harness()
   const signals = []
@@ -618,17 +677,28 @@ test('dropping a UI subscription aborts only its own Remote stream', async () =>
   assert.equal(signals[1].aborted, true)
 })
 
-test('side pane appends only the admitted turn and applies incremental text', () => {
+test('the side pane applies admitted turns and reply increments without rebuilding old turns', () => {
   const old = { question: 'old', reply: 'keep me', status: 'completed' }
   const initial = { id: 'thread', sessionId: 'main', version: 3, turns: [old] }
-  const pending = appendTurn(initial, { ...initial, version: 4, turnIndex: 1, turn: { question: 'new', reply: '', status: 'generating' } })
-  const prefix = applyReply(pending, 1, { version: 6, offset: 0, text: 'first', status: 'generating' })
-  const answer = applyReply(prefix, 1, { version: 9, offset: 5, text: ' second', status: 'completed', finishedAt: 123, usage: { outputTokens: 7 } })
+  const change = (version, firstTurn, turns, reply) => ({ kind: 'change', version, updatedAt: version, firstTurn, turns, reply })
+  const admitted = { question: 'new', reply: '', status: 'generating' }
+  const pending = applyThreadEvent(initial, change(4, 1, [admitted]))
+  assert.equal(applyThreadEvent(pending, change(4, 1, [admitted])), pending)
+  const prefix = applyThreadEvent(pending, change(6, 2, [], { offset: 0, text: 'first', status: 'generating' }))
+  const third = { question: 'third', reply: '', status: 'generating' }
+  const answer = applyThreadEvent(prefix, change(9, 2, [third], {
+    offset: 5, text: ' second', status: 'completed', finishedAt: 123, usage: { outputTokens: 7 },
+  }))
   assert.equal(answer.turns[0], old)
   assert.equal(answer.turns[1].reply, 'first second')
   assert.equal(answer.turns[1].finishedAt, 123)
   assert.deepEqual(answer.turns[1].usage, { outputTokens: 7 })
-  assert.equal(applyReply(answer, 1, { version: 6, offset: 0, text: 'old delta', status: 'generating' }), answer)
+  assert.equal(answer.turns[2], third)
+  assert.equal(applyThreadEvent(answer, change(6, 2, [])), answer)
+  assert.throws(() => applyThreadEvent(answer, change(10, 2, [])), /turn position/)
+  assert.throws(() => applyThreadEvent(prefix, change(10, 2, [], {
+    offset: 6, text: 'missed text', status: 'generating',
+  })), /reply offset/)
 })
 
 test('wire keeps generation success separate from a failed archive write', () => {

@@ -113,16 +113,10 @@ function parsePosition(value) {
   return checked(value, Number.isSafeInteger(value) && value >= 0, 'position')
 }
 
-export function appendTurn(detail, receipt) {
-  if (detail.id !== receipt.id || detail.sessionId !== receipt.sessionId
-    || receipt.turnIndex !== detail.turns.length || receipt.version <= detail.version) return detail
-  return { ...detail, updatedAt: receipt.updatedAt, version: receipt.version, turns: [...detail.turns, receipt.turn] }
-}
-
 export function applyReply(detail, turnIndex, update) {
   const turn = detail.turns[turnIndex]
   if (!turn || turn.status !== 'generating' || update.version <= detail.version) return detail
-  checked(update.offset <= turn.reply.length, 'reply offset')
+  checked(update.offset, update.offset <= turn.reply.length, 'reply offset')
   const turns = [...detail.turns]
   turns[turnIndex] = {
     ...turn, reply: turn.reply.slice(0, update.offset) + update.text, status: update.status,
@@ -143,10 +137,11 @@ function parseReceipt(value) {
   }
 }
 
-function parseReplyUpdate(value) {
-  object(value, ['version', 'updatedAt', 'offset', 'text', 'status', 'finishedAt', 'error', 'saveError', 'usage', 'timing'])
+const replyFields = ['offset', 'text', 'status', 'finishedAt', 'error', 'saveError', 'usage', 'timing']
+
+function parseReply(value) {
   const update = {
-    version: parseVersion(value.version), updatedAt: timestamp(value.updatedAt), offset: parsePosition(value.offset),
+    offset: parsePosition(value.offset),
     text: checked(value.text, typeof value.text === 'string', 'text'), status: status(value.status),
   }
   if (update.status !== 'generating') update.finishedAt = timestamp(value.finishedAt)
@@ -156,6 +151,24 @@ function parseReplyUpdate(value) {
   if (value.usage !== undefined) update.usage = parseUsage(value.usage)
   if (value.timing !== undefined) update.timing = parseTiming(value.timing)
   return update
+}
+
+function parseReplyUpdate(value) {
+  object(value, ['version', 'updatedAt', ...replyFields])
+  return { version: parseVersion(value.version), updatedAt: timestamp(value.updatedAt), ...parseReply(value) }
+}
+
+export function applyThreadEvent(detail, event) {
+  if (event.kind === 'snapshot') return event.detail
+  if (event.version <= detail.version) return detail
+  checked(event.firstTurn, event.firstTurn === detail.turns.length, 'thread turn position')
+  const changed = event.reply ? applyReply(detail, event.firstTurn - 1, {
+    ...event.reply, version: event.version, updatedAt: event.updatedAt,
+  }) : detail
+  return {
+    ...changed, version: event.version, updatedAt: event.updatedAt,
+    turns: event.turns.length ? [...changed.turns, ...event.turns] : changed.turns,
+  }
 }
 
 const detail = codec(`${PACKAGE_NAME}#Detail`, parseDetail)
@@ -207,6 +220,26 @@ export const descriptors = Object.freeze([
   descriptor('watchReply', [id, parameter('turnIndex', parsePosition), version], replyUpdate, true),
 ])
 
+function parseThreadEvent(value) {
+  if (value?.kind === 'snapshot') {
+    object(value, ['kind', 'detail'])
+    return { kind: 'snapshot', detail: parseDetail(value.detail) }
+  }
+  object(value, ['kind', 'version', 'updatedAt', 'firstTurn', 'reply', 'turns'])
+  checked(value.kind, value.kind === 'change', 'thread event kind')
+  checked(value.turns, Array.isArray(value.turns), 'added turns')
+  const version = parseVersion(value.version)
+  const updatedAt = timestamp(value.updatedAt)
+  const firstTurn = parsePosition(value.firstTurn)
+  const event = { kind: 'change', version, updatedAt, firstTurn, turns: value.turns.map(parseTurn) }
+  if (value.reply !== undefined) {
+    object(value.reply, replyFields)
+    event.reply = parseReply(value.reply)
+  }
+  return event
+}
+
 export const contextDescriptor = descriptor('contextCapacity', [id], codec(`${PACKAGE_NAME}#ContextWindow`, parseContext))
-export const TYPERT_REMOTE = Object.freeze({ package: PACKAGE_NAME, descriptors: Object.freeze([...descriptors, contextDescriptor]) })
+export const threadDescriptor = descriptor('watchThread', [id], codec(`${PACKAGE_NAME}#ThreadEvent`, parseThreadEvent), true)
+export const TYPERT_REMOTE = Object.freeze({ package: PACKAGE_NAME, descriptors: Object.freeze([...descriptors, contextDescriptor, threadDescriptor]) })
 export const createBtwContribution = () => TYPERT_REMOTE

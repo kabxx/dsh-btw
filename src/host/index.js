@@ -4,7 +4,7 @@ import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import {
-  CONTEXT_OVERFLOW, PACKAGE_NAME, TOKEN_FIELDS, contextDescriptor, parseDetail, parseQuestion, parseSessionId, parseThreadId, parseVersion,
+  CONTEXT_OVERFLOW, PACKAGE_NAME, TOKEN_FIELDS, contextDescriptor, parseDetail, parseQuestion, parseSessionId, parseThreadId, parseVersion, threadDescriptor,
 } from '../shared/wire.js'
 import { sessionThreadStore } from './session-store.js'
 
@@ -329,6 +329,17 @@ function readUsage(usage) {
     if (Number.isSafeInteger(count) && count >= 0) counts[key] = count
   }
   return Object.keys(counts).length > 0 ? counts : undefined
+}
+
+function replyDelta(previousText, turn) {
+  const offset = previousText !== undefined && turn.reply.startsWith(previousText) ? previousText.length : 0
+  const { status, finishedAt, error, saveError, usage, timing } = publicTurn(turn)
+  return {
+    offset, text: turn.reply.slice(offset), status,
+    ...(finishedAt !== undefined && { finishedAt }), ...(error !== undefined && { error }),
+    ...(saveError !== undefined && { saveError }), ...(usage !== undefined && { usage }),
+    ...(timing !== undefined && { timing }),
+  }
 }
 
 // Coalesce UI wakeups: each watcher reads the newest immutable revision, so a slow
@@ -664,6 +675,38 @@ export class BtwHost {
     }
   }
 
+  async *watchThread(sessionId, id, assertAccess, requestSignal) {
+    const signal = requestSignal
+      ? AbortSignal.any([requestSignal, this.lifetime.signal])
+      : this.lifetime.signal
+    let previous
+    while (!signal.aborted) {
+      assertAccess()
+      const record = this.read(sessionId, id)
+      if (!previous) {
+        previous = record
+        yield { kind: 'snapshot', detail: toDetail(record) }
+        continue
+      }
+      if (record.version !== previous.version) {
+        const firstTurn = previous.turns.length
+        const reply = isDone(previous) ? undefined : replyDelta(newest(previous).reply, record.turns[firstTurn - 1])
+        previous = record
+        yield {
+          kind: 'change', version: record.version, updatedAt: record.updatedAt, firstTurn,
+          turns: record.turns.slice(firstTurn).map(publicTurn), ...(reply && { reply }),
+        }
+        continue
+      }
+      try {
+        await waitForPulse(this.listeners, id, signal)
+      } catch (error) {
+        if (signal.aborted) return
+        throw error
+      }
+    }
+  }
+
   async *watchReply(sessionId, id, turnIndex, version, assertAccess, requestSignal) {
     const signal = requestSignal
       ? AbortSignal.any([requestSignal, this.lifetime.signal])
@@ -676,16 +719,10 @@ export class BtwHost {
       if (!turn) throw fault('not-found', '找不到这轮侧问。')
       if (record.version !== version || turn.status !== 'generating') {
         // A changed baseline may have reordered text blocks before we began watching.
-        const start = previousText !== undefined && turn.reply.startsWith(previousText) ? previousText.length : 0
-        const { status, finishedAt, error, saveError, usage, timing } = turn
+        const delta = replyDelta(previousText, turn)
         version = record.version
         previousText = turn.reply
-        yield {
-          version, updatedAt: record.updatedAt, offset: start, text: turn.reply.slice(start), status,
-          ...(finishedAt !== undefined && { finishedAt }), ...(error !== undefined && { error }),
-          ...(saveError !== undefined && { saveError }), ...(usage !== undefined && { usage }),
-          ...(timing !== undefined && { timing }),
-        }
+        yield { version, updatedAt: record.updatedAt, ...delta }
       } else if (previousText === undefined) {
         previousText = turn.reply
       }
@@ -737,7 +774,7 @@ export default class BtwService extends TypertRemoteService {
     // contribution with the live plugin so an installed update exposes it immediately.
     this.ctx.typert.register({
       package: `${PACKAGE_NAME}-meter`, face: 'host', schemas: [],
-      model: { services: [], events: [], objects: [] }, invocations: [contextDescriptor],
+      model: { services: [], events: [], objects: [] }, invocations: [contextDescriptor, threadDescriptor],
     })
   }
 
@@ -785,6 +822,11 @@ export default class BtwService extends TypertRemoteService {
   async *watch(agent, id, version, signal) {
     const { sessionId } = await this.prepare(agent, signal)
     yield* this.host.watch(sessionId, id, version, () => this.sessionFor(agent), signal)
+  }
+
+  async *watchThread(agent, id, signal) {
+    const { sessionId } = await this.prepare(agent, signal)
+    yield* this.host.watchThread(sessionId, id, () => this.sessionFor(agent), signal)
   }
 
   async *watchReply(agent, id, turnIndex, version, signal) {

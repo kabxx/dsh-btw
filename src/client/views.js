@@ -1,4 +1,4 @@
-import { CONTEXT_OVERFLOW, appendTurn, applyReply } from '../shared/wire.js';
+import { CONTEXT_OVERFLOW, applyThreadEvent } from '../shared/wire.js';
 
 // The containing DSH slots own column widths, the mobile sidebar shell, and focus outside BTW.
 export const styles = String.raw`
@@ -508,6 +508,43 @@ function isRunning(status) {
   return status === 'generating' || status === 'running' || status === 'streaming' || status === 'pending';
 }
 
+export function watchDetail(controller, sessionId, id, { onDetail, onContext, onError }) {
+  let current;
+  let contextRequest;
+  const unsubscribe = controller.watchThread(sessionId, id, event => {
+    const snapshot = event.kind === 'snapshot';
+    if (snapshot) {
+      if (event.detail.id !== id || event.detail.sessionId !== sessionId) {
+        onError('missingThread');
+        return;
+      }
+    } else if (!current) {
+      throw new Error('BTW thread stream did not send a snapshot');
+    }
+    const previous = current;
+    current = applyThreadEvent(previous, event);
+    const running = isRunning(current.turns.at(-1)?.status);
+    if (!running) controller.clearGeneratingNotice(sessionId, id);
+    onDetail(current);
+
+    // DSH sends a fresh snapshot after reconnect, even if the latest turn is unchanged.
+    if (!snapshot && previous.turns.length === current.turns.length &&
+        isRunning(previous.turns.at(-1)?.status) === running) return;
+    contextRequest?.abort();
+    if (!current.turns.length) return;
+    const request = contextRequest = new AbortController();
+    Promise.resolve().then(() => {
+      if (!request.signal.aborted) return controller.call('contextCapacity', sessionId, id, request.signal);
+    }).then(result => {
+      if (!request.signal.aborted) onContext(result);
+    }, () => {});
+  }, error => onError(current ? 'streamFailed' : error?.code === 'btw/not-found' ? 'missingThread' : 'loadFailed'));
+  return () => {
+    contextRequest?.abort();
+    unsubscribe();
+  };
+}
+
 // Like DSH's token meter, omitted cache buckets count as zero for reported usage.
 export function createCompositionGuard(now = Date.now) {
   let composing = false;
@@ -968,55 +1005,26 @@ export function createViews(React) {
                 h(Icon, { name: 'right' })))))));
   }
 
-  function useDetail({ controller, sessionId, id, revision, reload }) {
+  function useDetail({ controller, sessionId, id, revision }) {
     const [loaded, setLoaded] = useState(null);
     const [failure, setFailure] = useState('');
     const [contextSample, setContextSample] = useState(null);
-    const detail = loaded?.revision === revision ? loaded.detail : undefined;
+    const detail = loaded?.detail;
     const context = contextSample?.revision === revision ? contextSample.value : null;
-    const turnIndex = detail ? detail.turns.length - 1 : -1;
-    const running = isRunning(detail?.turns[turnIndex]?.status);
 
     useEffect(() => {
-      let alive = true;
       setFailure('');
-      Promise.resolve().then(() => controller.call('get', sessionId, id)).then(next => {
-        if (!alive) return;
-        if (next?.id === id && next.sessionId === sessionId) setLoaded({ detail: next, revision });
-        else setFailure('missingThread');
-      }, () => { if (alive) setFailure('loadFailed'); });
-      return () => { alive = false; };
+      return watchDetail(controller, sessionId, id, {
+        onDetail(detail) {
+          setFailure('');
+          setLoaded({ detail, revision });
+        },
+        onContext(value) { setContextSample({ revision, value }); },
+        onError: setFailure,
+      });
     }, [controller, id, revision, sessionId]);
 
-    useEffect(() => {
-      if (turnIndex < 0) return undefined;
-      const request = new AbortController();
-      Promise.resolve().then(() => controller.call('contextCapacity', sessionId, id, request.signal)).then(result => {
-        if (!request.signal.aborted) setContextSample({ revision, value: result });
-      }, () => {});
-      return () => request.abort();
-    }, [controller, id, revision, running, sessionId, turnIndex]);
-
-    useEffect(() => {
-      if (!running) return undefined;
-      // Use the version at subscription start. Applying a delta must not reconnect the stream.
-      return controller.watchReply(sessionId, id, turnIndex, detail.version, update => {
-        setLoaded(previous => previous?.revision === revision
-          ? { ...previous, detail: applyReply(previous.detail, turnIndex, update) } : previous);
-      }, () => setFailure('streamFailed'));
-    }, [controller, id, revision, running, sessionId, turnIndex]);
-
-    function accept(receipt) {
-      const next = appendTurn(detail, receipt);
-      if (next === detail) {
-        // Another client can have added a turn between this pane's read and our send.
-        reload();
-        return;
-      }
-      setFailure('');
-      setLoaded({ detail: next, revision });
-    }
-    return { detail, context, failure, accept };
+    return { detail, context, failure, synchronized: loaded?.revision === revision && !failure };
   }
 
   function Thread({ detail, renderFactorySlot, t, language, scrollRef, followRef, streamFailed, performanceUsage, overflowNotice }) {
@@ -1418,7 +1426,7 @@ export function createViews(React) {
   function Chat({ controller, sessionId, id, t, renderFactorySlot, language, dictationAvailable, speechMounted, speechSettings, performanceUsage, pane, onBack }) {
     const [revision, setRevision] = useState(0);
     const reload = () => setRevision(value => value + 1);
-    const { detail, context, failure, accept } = useDetail({ controller, sessionId, id, revision, reload });
+    const { detail, context, failure, synchronized } = useDetail({ controller, sessionId, id, revision });
     const readDraft = useCallback(() => controller.getDraft(sessionId, id), [controller, sessionId, id]);
     const draftState = useSyncExternalStore(controller.subscribeDrafts, readDraft, readDraft);
     const appliedReceipt = useRef(null);
@@ -1429,10 +1437,10 @@ export function createViews(React) {
       const { receipt } = draftState;
       if (!receipt || !detail || appliedReceipt.current === receipt) return;
       appliedReceipt.current = receipt;
-      if (receipt.turnIndex < detail.turns.length) return;
+      if (receipt.turnIndex < detail.turns.length - 1) return;
       follow.current = true;
-      accept(receipt);
-    }, [draftState.receipt, detail, accept]);
+      if (scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight;
+    }, [draftState.receipt, detail]);
     useLayoutEffect(() => { if (!pane.restored) heading.current?.focus({ preventScroll: true }); }, [pane]);
     const question = detail?.question ?? t('title');
     const last = detail?.turns.at(-1);
@@ -1448,7 +1456,7 @@ export function createViews(React) {
           streamFailed: failure === 'streamFailed', overflowNotice }),
         h('div', { className: 'dsh-btw-reply-dock' },
           h(Composer, { controller, sessionId, id, t,
-            busy: isRunning(last?.status) || (draftState.receipt?.turnIndex ?? -1) >= detail.turns.length,
+            busy: !synchronized || isRunning(last?.status) || (draftState.receipt?.turnIndex ?? -1) >= detail.turns.length,
             overflowed, overflowNotice, dictationAvailable, speechMounted, speechSettings, draftState }),
           h(UsageAudit, { turns: detail.turns, contextSample: context, performanceUsage, t, language }))));
   }
