@@ -308,6 +308,15 @@ export const styles = String.raw`
 .dsh-btw-context-track, .dsh-btw-context-fill { fill: none; stroke-width: 2; }
 .dsh-btw-context-track { stroke: var(--dsw-alias-border-l3); }
 .dsh-btw-context-fill { stroke: var(--dsw-alias-label-tertiary); stroke-linecap: round; }
+/* Match the native file sidebar's loading note. */
+.dsh-btw-list:has(> .dsh-btw-loading-note) { padding-block-start: 8px; }
+.dsh-btw-loading-note {
+  margin: 0;
+  padding: 3px 10px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
 .dsh-btw-feedback { margin: 6px 8px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
 .dsh-btw-turn-feedback { margin: 3px 0 0; }
 .dsh-btw-failure { color: var(--dsw-alias-state-error-primary); }
@@ -729,6 +738,10 @@ export function createViews(React) {
       message ? formatMessageTime(value, language) : date.text);
   }
 
+  function LoadingNote({ t }) {
+    return h('p', { className: 'dsh-btw-loading-note', role: 'status' }, t('loading'));
+  }
+
   function Feedback({ text, onRetry, t, error = false, inline = false, id }) {
     return h('div', { id, className: `dsh-btw-feedback${error ? ' dsh-btw-failure' : ''}${inline ? ' dsh-btw-turn-feedback' : ''}`, role: 'status' },
       text, onRetry && h('button', { type: 'button', className: 'dsh-btw-retry', onClick: onRetry }, t('retry')));
@@ -929,7 +942,7 @@ export function createViews(React) {
         h('h2', { id: scopeId, className: 'dsh-btw-bar-title' }, t('listTitle'))),
       h('section', { className: 'dsh-btw-list', ref: scroller, 'aria-labelledby': scopeId },
         load.failed ? h(Feedback, { text: t('loadFailed'), t, onRetry: reload, error: true }) :
-          !load.rows ? h(Feedback, { text: t('loading'), t }) :
+          !load.rows ? h(LoadingNote, { t }) :
             load.rows.length === 0 ? h(Feedback, { text: t('emptyList'), t }) :
               h('ul', { className: 'dsh-btw-history' }, load.rows.map(row =>
                 h('li', { key: row.id }, h('button', {
@@ -1428,7 +1441,7 @@ export function createViews(React) {
         h(IconButton, { icon: 'back', label: t('back'), onClick: onBack }),
         h('h2', { className: 'dsh-btw-bar-title', ref: heading, tabIndex: -1, title: question }, question)),
       failure && h(Feedback, { text: t(failure), t, error: true, onRetry: reload }),
-      !detail ? !failure && h(Feedback, { text: t('loading'), t }) : h(Fragment, null,
+      !detail ? !failure && h('div', { className: 'dsh-btw-list' }, h(LoadingNote, { t })) : h(Fragment, null,
         h(Thread, { detail, renderFactorySlot, t, language, scrollRef: scroll, followRef: follow, performanceUsage,
           streamFailed: failure === 'streamFailed', overflowNotice }),
         h('div', { className: 'dsh-btw-reply-dock' },
