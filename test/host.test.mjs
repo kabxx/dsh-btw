@@ -16,7 +16,7 @@ const dshPackage = process.env.DSH_INSTALL_DIR
 const fromDsh = name => import(pathToFileURL(createRequire(dshPackage).resolve(name)).href)
 const [
   { Context }, { TypertRegistry }, { TypertGatewayService }, { Session }, { DeepSeekAdapter },
-  { default: LlmRuntime, isAgentLoopRequest, markAgentLoopRequest }, piAiPlugin,
+  { default: LlmRuntime, isAgentLoopRequest, markAgentLoopRequest }, piAiPlugin, { createScope },
 ] = await Promise.all([
   fromDsh('@deepseek-ai/cordis'),
   fromDsh('@deepseek-ai/dsh-typert-registry'),
@@ -25,6 +25,7 @@ const [
   fromDsh('@deepseek-ai/dsh-llm-deepseek'),
   fromDsh('@deepseek-ai/dsh-llm'),
   fromDsh('@deepseek-ai/dsh-llm-pi-ai'),
+  fromDsh('@deepseek-ai/dsh-scope'),
 ])
 
 function memoryStore(saved = new Map(), afterPut) {
@@ -156,6 +157,83 @@ test('session storage keeps different sessions and creation versions separate', 
   await assert.rejects(readFile(first.archiveFile(id)), { code: 'ENOENT' })
 })
 
+test('an old Host stops writing before the successor takes over the session', { timeout: 5000 }, async t => {
+  const fixture = await sessionFolder(t)
+  const archive = sessionThreadStore({ stat: async () => ({ location: fixture.location }) }, record => threadSchema.parse(record))
+  const oldWriteEntered = Promise.withResolvers()
+  const oldWriteFinished = Promise.withResolvers()
+  const releaseOldWrite = Promise.withResolvers()
+  let holdOldCheckpoint = true
+  const oldStore = {
+    async open(...args) {
+      const opened = await archive.open(...args)
+      return {
+        records: opened.records,
+        async put(record, signal) {
+          if (!holdOldCheckpoint || latest(record).reply !== 'uncommitted old fragment') {
+            return opened.put(record, signal)
+          }
+          holdOldCheckpoint = false
+          oldWriteEntered.resolve()
+          await releaseOldWrite.promise
+          try {
+            await opened.put(record, signal)
+            oldWriteFinished.resolve({ saved: true })
+          } catch (error) {
+            oldWriteFinished.resolve({ error })
+            throw error
+          }
+        },
+      }
+    },
+  }
+  const modelA = controlledModel()
+  const modelB = controlledModel()
+  const hostA = new BtwHost({ store: oldStore, llm: modelA })
+  const hostB = new BtwHost({ store: archive, llm: modelB })
+  const ownerA = makeAgent('handoff')
+  const agentScope = createScope(new Context(), ownerA)
+  ownerA.ctx = agentScope.ctx
+  const ownerB = makeAgent('handoff')
+  const returned = makeAgent('handoff')
+  try {
+    await hostA.prepare('handoff', undefined, ownerA)
+    const { id } = await hostA.create(ownerA, 'first question')
+    const oldCall = await modelA.waitForCount(1)
+    oldCall.emit(text('uncommitted old fragment'))
+    await oldWriteEntered.promise
+    // AgentLoop disposes this scope before releasing the session lease, and
+    // emits agent/disposed later. Let B take over before delivering that event.
+    await agentScope.dispose()
+    await hostB.prepare('handoff', undefined, ownerB)
+    releaseOldWrite.resolve()
+    assert.equal((await oldWriteFinished.promise).error?.name, 'AbortError')
+    assert.equal(latest(await fixture.read(id)).status, 'interrupted')
+    assert.equal(latest(await fixture.read(id)).reply, '')
+    await assert.rejects(hostA.create(ownerA, 'late first question'))
+    hostA.retire('handoff', ownerA)
+    await hostB.followup('handoff', id, 'B follow-up')
+    const callB = await modelB.waitForCount(1)
+    callB.emit(text('B answer'))
+    callB.emit(finish())
+    await terminal(hostB.watch('handoff', id, null, () => {}))
+    hostB.retire('handoff', ownerB)
+    await hostA.prepare('handoff', undefined, returned)
+    await hostA.followup('handoff', id, 'A follow-up')
+    const callA = await modelA.waitForCount(2)
+    callA.emit(text('A answer'))
+    callA.emit(finish())
+    await terminal(hostA.watch('handoff', id, null, () => {}))
+    assert.deepEqual((await fixture.read(id)).turns.map(turn => [turn.question, turn.reply]), [
+      ['first question', ''], ['B follow-up', 'B answer'], ['A follow-up', 'A answer'],
+    ])
+    assert.equal(await readFile(fixture.location.path, 'utf8'), 'main transcript fixture')
+  } finally {
+    releaseOldWrite.resolve()
+    await Promise.all([hostA.close(), hostB.close()])
+  }
+})
+
 test('side questions cannot recreate a removed main session directory', async () => {
   await using scratch = await mkdtempDisposable(join(tmpdir(), 'dsh-btw-removed-session-'))
   const sessionDir = join(scratch.path, 'session')
@@ -168,7 +246,7 @@ test('side questions cannot recreate a removed main session directory', async ()
   const host = new BtwHost({ store, llm })
   const agent = makeAgent('session-removed')
   try {
-    assert.equal(await host.prepare(agent.session.id), true)
+    assert.equal(await host.prepare(agent.session.id, undefined, agent), true)
     await rename(sessionDir, removedDir)
     await assert.rejects(host.create(agent, 'side question'), { code: 'btw/save-failed' })
     await assert.rejects(stat(sessionDir), { code: 'ENOENT' })

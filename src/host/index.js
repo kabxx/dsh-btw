@@ -378,44 +378,75 @@ export class BtwHost {
     this.runs = new Map()
     this.listeners = new Map()
     this.sessions = new Map()
-    this.opening = new Map()
+    this.opening = new Set()
+    this.running = new Set()
     this.admissions = new Set()
     this.lifetime = new AbortController()
   }
 
-  async prepare(sessionId, signal) {
+  async prepare(sessionId, signal, owner) {
     signal?.throwIfAborted()
     this.lifetime.signal.throwIfAborted()
-    if (this.opening.has(sessionId) || !this.sessions.has(sessionId)) {
-      let opening = this.opening.get(sessionId)
-      if (!opening) {
-        opening = this.openSession(sessionId).finally(() => this.opening.delete(sessionId))
-        this.opening.set(sessionId, opening)
-      }
-      await opening
+    let state = this.sessions.get(sessionId)
+    if (state && owner && state.owner !== owner) {
+      this.retire(sessionId, state.owner)
+      state = undefined
     }
+    if (!state) {
+      state = { owner, controller: new AbortController(), records: new Map() }
+      // AgentLoop disposes the agent scope before closing the session write handle.
+      state.disposeOwner = owner?.ctx?.effect(() => () => {
+        state.disposeOwner = undefined
+        if (this.sessions.get(sessionId) === state) this.retire(sessionId, owner)
+      }, 'btw.archiveOwner')
+      this.sessions.set(sessionId, state)
+      const opening = this.openSession(sessionId, state).finally(() => {
+        this.opening.delete(opening)
+        state.opening = undefined
+        if (!state.archive && this.sessions.get(sessionId) === state) {
+          this.sessions.delete(sessionId)
+          return state.disposeOwner?.()
+        }
+      })
+      state.opening = opening
+      this.opening.add(opening)
+    }
+    await state.opening
     signal?.throwIfAborted()
     this.lifetime.signal.throwIfAborted()
-    return this.sessions.has(sessionId)
+    state.controller.signal.throwIfAborted()
+    return !!state.archive
   }
 
-  async openSession(sessionId) {
-    const archive = await this.store.open(sessionId, this.lifetime.signal)
+  retire(sessionId, owner) {
+    const state = this.sessions.get(sessionId)
+    if (!state || state.owner !== owner) return
+    this.sessions.delete(sessionId)
+    state.controller.abort()
+    for (const id of state.records.keys()) this.notify(id)
+    return state.disposeOwner?.()
+  }
+
+  async openSession(sessionId, state) {
+    const signal = AbortSignal.any([state.controller.signal, this.lifetime.signal])
+    const archive = await this.store.open(sessionId, signal)
     if (!archive) return
-    this.sessions.set(sessionId, { archive, records: new Map() })
+    signal.throwIfAborted()
+    state.archive = archive
     for (const record of archive.records) {
-      this.publish(record, false)
+      this.publish(record, false, state)
       if (isDone(record)) continue
       const time = Math.max(Date.now(), record.updatedAt)
       const terminal = withLatest(record, {
         ...newest(record), status: 'interrupted', finishedAt: time, error: INTERRUPTION,
       }, time)
-      this.publish(terminal, false)
+      this.publish(terminal, false, state)
       try {
-        await this.save(terminal)
+        await this.save(terminal, state)
       } catch {
+        if (state.controller.signal.aborted) break
         this.logger?.error('BTW could not save a recovered reply')
-        this.publish(withLatest(terminal, { ...newest(terminal), saveError: ARCHIVE_ERROR }, time), false)
+        this.publish(withLatest(terminal, { ...newest(terminal), saveError: ARCHIVE_ERROR }, time), false, state)
       }
     }
   }
@@ -428,9 +459,10 @@ export class BtwHost {
     this.mainRequests.set(session, { request, anchor, usesAdapterDefault })
   }
 
-  async save(record) {
+  async save(record, state) {
+    state.controller.signal.throwIfAborted()
     const turns = record.turns.map(({ saveError, ...turn }) => turn)
-    await this.sessions.get(record.sessionId).archive.put(threadSchema.parse({ ...record, turns }))
+    await state.archive.put(threadSchema.parse({ ...record, turns }), state.controller.signal)
   }
 
   read(sessionId, id) {
@@ -491,7 +523,7 @@ export class BtwHost {
   async create(agent, question, signal) {
     parseQuestion(question)
     const sessionId = parseSessionId(agent.session.id)
-    if (!await this.prepare(sessionId, signal)) {
+    if (!await this.prepare(sessionId, signal, agent)) {
       throw fault('session-not-saved', '请先发送一条消息开始侧问')
     }
     const selected = agent.model.current()
@@ -514,7 +546,7 @@ export class BtwHost {
     this.lifetime.signal.throwIfAborted()
     parseQuestion(question)
     const record = this.read(sessionId, id)
-    if (this.runs.has(id) || !isDone(record)) throw fault('generating', '上一条回复仍在生成。')
+    if (this.runs.get(id)?.state === this.sessions.get(sessionId) || !isDone(record)) throw fault('generating', '上一条回复仍在生成。')
     if (newest(record).error === CONTEXT_OVERFLOW) throw fault('context-overflow', '已达上下文上限。')
     const time = Math.max(Date.now(), record.updatedAt)
     return this.admit(nextRevision(record, [...record.turns, nextTurn(question, time)], time), admitted => {
@@ -525,17 +557,21 @@ export class BtwHost {
 
   admit(record, result = toDetail) {
     const controller = new AbortController()
-    const run = { controller, promise: undefined }
+    const state = this.sessions.get(record.sessionId)
+    const run = { controller, state }
     this.runs.set(record.id, run)
-    const admission = this.save(record).then(() => {
-      this.publish(record)
+    const admission = this.save(record, state).then(() => {
+      state.controller.signal.throwIfAborted()
+      this.publish(record, true, state)
       // Start only after durable admission. No caller/transport signal is inherited.
-      run.promise = this.generate(record, controller.signal, () => {
+      const generation = this.generate(record, controller.signal, () => {
         if (this.runs.get(record.id) === run) this.runs.delete(record.id)
-      })
+      }, state)
+      this.running.add(generation)
+      generation.then(() => this.running.delete(generation), () => this.running.delete(generation))
       return result(record)
     }).catch(error => {
-      this.runs.delete(record.id)
+      if (this.runs.get(record.id) === run) this.runs.delete(record.id)
       this.logger?.error('BTW could not admit a question')
       throw fault('save-failed', '保存侧问失败。')
     })
@@ -544,8 +580,9 @@ export class BtwHost {
     return admission
   }
 
-  publish(record, wake = true) {
-    this.sessions.get(record.sessionId).records.set(record.id, record)
+  publish(record, wake = true, state) {
+    if (state.controller.signal.aborted) return
+    state.records.set(record.id, record)
     if (wake) this.notify(record.id)
   }
 
@@ -553,8 +590,8 @@ export class BtwHost {
     for (const listener of this.listeners.get(id) ?? []) listener()
   }
 
-  async generate(record, runSignal, releaseRun) {
-    const signal = AbortSignal.any([runSignal, this.lifetime.signal])
+  async generate(record, runSignal, releaseRun, state) {
+    const signal = AbortSignal.any([runSignal, this.lifetime.signal, state.controller.signal])
     const assembler = new BlockAssembler()
     let current = record
     let checkpointVersion = record.version
@@ -568,7 +605,7 @@ export class BtwHost {
       if (pendingSave || checkpointVersion === current.version || signal.aborted) return
       const checkpoint = current
       checkpointVersion = checkpoint.version
-      pendingSave = this.save(checkpoint).catch(() => {
+      pendingSave = this.save(checkpoint, state).catch(() => {
         this.logger?.error('BTW could not save a reply checkpoint')
       }).finally(() => { pendingSave = undefined })
     }, CHECKPOINT_INTERVAL_MS)
@@ -601,7 +638,7 @@ export class BtwHost {
         const reply = assembler.interruptedBlocks().filter(block => block.type === 'text').map(block => block.text).join('')
         const time = Date.now()
         current = withLatest(current, { ...newest(current), reply }, time)
-        this.publish(current, false)
+        this.publish(current, false, state)
         if (time - lastNotified >= PREVIEW_INTERVAL_MS) {
           clearTimeout(previewTimer)
           sendPreview()
@@ -618,6 +655,10 @@ export class BtwHost {
     const timing = { requestMs: Math.round(performance.now() - startedAt),
       ...(firstTokenMs !== undefined && { firstTokenMs }) }
     await pendingSave
+    if (state.controller.signal.aborted) {
+      releaseRun()
+      return
+    }
     const time = Math.max(Date.now(), current.updatedAt)
     const turn = newest(current)
     const interrupted = signal.aborted || finish === 'aborted'
@@ -641,13 +682,13 @@ export class BtwHost {
       timing,
     }, time)
     try {
-      await this.save(terminal)
+      await this.save(terminal, state)
       releaseRun()
-      this.publish(terminal)
+      this.publish(terminal, true, state)
     } catch {
       this.logger?.error('BTW could not save a terminal reply')
       releaseRun()
-      this.publish(withLatest(terminal, { ...newest(terminal), saveError: ARCHIVE_ERROR }, time))
+      this.publish(withLatest(terminal, { ...newest(terminal), saveError: ARCHIVE_ERROR }, time), true, state)
     }
   }
 
@@ -740,8 +781,9 @@ export class BtwHost {
   async close() {
     this.lifetime.abort()
     await Promise.allSettled([...this.admissions])
-    await Promise.allSettled([...this.runs.values()].map(run => run.promise))
+    await Promise.allSettled([...this.running])
     await Promise.allSettled([...this.opening.values()])
+    await Promise.allSettled([...this.sessions].map(([id, state]) => this.retire(id, state.owner)))
   }
 }
 
@@ -758,6 +800,7 @@ export default class BtwService extends TypertRemoteService {
     })
     const host = new BtwHost({ store, llm: this.ctx.llm, logger: this.ctx.logger })
     this.ctx.effect(() => () => host.close(), 'btw.close')
+    this.ctx.on('agent/disposed', ({ agent }) => host.retire(agent.session.id, agent))
     this.ctx.on('llm/stream', (request, next) => {
       if (isAgentLoopRequest(request) && request.sessionId) {
         const session = this.ctx.agents.get(request.sessionId)?.session
@@ -788,7 +831,7 @@ export default class BtwService extends TypertRemoteService {
 
   async prepare(agent, signal) {
     const sessionId = this.sessionFor(agent)
-    const available = await this.host.prepare(sessionId, signal)
+    const available = await this.host.prepare(sessionId, signal, agent)
     this.sessionFor(agent)
     return { sessionId, available }
   }

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { renameSync } from 'node:fs'
+import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { PACKAGE_NAME, parseThreadId } from '../shared/wire.js'
@@ -79,7 +80,8 @@ export function sessionThreadStore(persistence, parseRecord, onMalformedRecord) 
       signal.throwIfAborted()
       return {
         records,
-        async put(record) {
+        async put(record, ownerSignal = signal) {
+          ownerSignal.throwIfAborted()
           const id = parseThreadId(record.id)
           const file = files.get(id) ?? join(root, `v${version}`, 'threads', `${id}.json`)
           let directory = sessionDirectory
@@ -94,7 +96,10 @@ export function sessionThreadStore(persistence, parseRecord, onMalformedRecord) 
           try {
             const envelope = { schemaVersion: SCHEMA_VERSION, record }
             await writeFile(temporary, `${JSON.stringify(envelope)}\n`, { flag: 'wx', mode: 0o600 })
-            await rename(temporary, file)
+            // DSH emits agent/disposed before releasing its session write lease.
+            // Keep the ownership check and final replacement in the same JS turn.
+            ownerSignal.throwIfAborted()
+            renameSync(temporary, file)
           } catch (error) {
             await unlink(temporary).catch(() => {})
             throw error
