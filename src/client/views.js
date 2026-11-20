@@ -509,6 +509,22 @@ function isRunning(status) {
 }
 
 // Like DSH's token meter, omitted cache buckets count as zero for reported usage.
+export function createCompositionGuard(now = Date.now) {
+  let composing = false;
+  let composingUntil = 0;
+  return {
+    start() { composing = true; },
+    end() {
+      composing = false;
+      // Match the closing keydown window in DSH's composer keymap.
+      composingUntil = now() + 10;
+    },
+    active: () => composing,
+    blocksSubmit: event => composing || now() < composingUntil ||
+      event.nativeEvent?.isComposing || event.keyCode === 229,
+  };
+}
+
 export function summarizeUsage(turns) {
   let uncached = 0;
   let cacheRead = 0;
@@ -1134,7 +1150,7 @@ export function createViews(React) {
     const [retainedTranscript, setRetainedTranscript] = useState('');
     const input = useRef(null);
     const form = useRef(null);
-    const composing = useRef(false);
+    const [composition] = useState(createCompositionGuard);
     const pendingTranscript = useRef(null);
     const selectionAfterInsert = useRef(null);
     const live = useRef(false);
@@ -1147,7 +1163,7 @@ export function createViews(React) {
     function insertSpeech(text, selection) {
       const node = input.current;
       if (!node || node.disabled) return;
-      if (composing.current) {
+      if (composition.active()) {
         pendingTranscript.current = { text, selection };
         return;
       }
@@ -1208,7 +1224,7 @@ export function createViews(React) {
 
     function submit(event) {
       event.preventDefault();
-      if (sendBlocked || composing.current) return;
+      if (sendBlocked || composition.blocksSubmit(event)) return;
       void controller.submitDraft(sessionId, id).catch(() => {});
     }
 
@@ -1218,13 +1234,13 @@ export function createViews(React) {
         event.stopPropagation();
         dictation.cancel();
       }
-      if (locked || event.key !== 'Enter' || event.shiftKey || composing.current || event.nativeEvent.isComposing || event.keyCode === 229) return;
+      if (locked || event.key !== 'Enter' || event.shiftKey || composition.blocksSubmit(event)) return;
       event.preventDefault();
       if (!sendBlocked && !event.repeat) form.current?.requestSubmit();
     }
 
     function finishComposition() {
-      composing.current = false;
+      composition.end();
       const pending = pendingTranscript.current;
       pendingTranscript.current = null;
       if (pending && !locked) queueMicrotask(() => { if (live.current && !input.current?.disabled) insertSpeech(pending.text, pending.selection); });
@@ -1270,7 +1286,7 @@ export function createViews(React) {
           id: inputId, ref: input, className: 'dsh-btw-input', rows: 1, placeholder: t('placeholder'), value: draft,
           disabled: locked,
           onChange: event => controller.setDraft(sessionId, id, event.target.value),
-          onKeyDown: keyDown, onCompositionStart: () => { composing.current = true; }, onCompositionEnd: finishComposition,
+          onKeyDown: keyDown, onCompositionStart: composition.start, onCompositionEnd: finishComposition,
         }),
         h('div', { className: 'dsh-btw-form-actions' },
           !locked && dictating && h(IconButton, { icon: 'close', label: t('micCancel'), onClick: dictation.cancel }),

@@ -5,7 +5,7 @@ import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { inject, makeController, makeSource, mountClient, observeSpeech } from '../src/client/index.js'
 import { appendTurn, applyReply, parseSessionId, parseTurn } from '../src/shared/wire.js'
-import { contextReading, formatMessageTime, formatTokenCount, orderHistory, summarizeUsage } from '../src/client/views.js'
+import { contextReading, createCompositionGuard, formatMessageTime, formatTokenCount, orderHistory, summarizeUsage } from '../src/client/views.js'
 import zh from '../locale/zh.json' with { type: 'json' }
 import en from '../locale/en.json' with { type: 'json' }
 
@@ -78,6 +78,24 @@ test('usage prefers each reported total and falls back to available buckets', ()
     { status: 'completed', usage: { totalTokens: 2 } },
     { status: 'generating', usage: { totalTokens: 1_000 } },
   ]), { uncached: 20, cacheRead: 5, cacheWrite: 5, output: 8, total: 140, cacheRatio: 5 / 30 })
+})
+
+test('a late Safari composition confirmation cannot submit the draft', () => {
+  let time = 100;
+  const guard = createCompositionGuard(() => time);
+  const enter = { key: 'Enter', nativeEvent: { isComposing: false } };
+  guard.start();
+  assert.ok(guard.active());
+  assert.ok(guard.blocksSubmit(enter));
+  guard.end();
+  assert.equal(guard.active(), false);
+  assert.ok(guard.blocksSubmit(enter));
+  time += 9;
+  assert.ok(guard.blocksSubmit(enter));
+  time += 1;
+  assert.ok(!guard.blocksSubmit(enter));
+  assert.ok(guard.blocksSubmit({ ...enter, keyCode: 229 }));
+  assert.ok(guard.blocksSubmit({ ...enter, nativeEvent: { isComposing: true } }));
 })
 
 test('sidebar formats token counts and clocks like the host and renders the estimated context separately', () => {
