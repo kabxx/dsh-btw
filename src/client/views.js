@@ -909,9 +909,10 @@ export function createViews(React) {
     const current = acceptDetail(liveDetail, detail.version > liveDetail.version ? detail : null);
     const firstTurn = current.turns[0];
     const running = isRunning(firstTurn?.status);
+    const watching = running || Boolean(firstTurn?.saveError);
 
     useEffect(() => {
-      if (!running) return undefined;
+      if (!watching) return undefined;
       let mounted = true;
       let close;
       setFailed(false);
@@ -923,7 +924,7 @@ export function createViews(React) {
         }, () => { if (mounted) setFailed(true); });
       } catch { setFailed(true); }
       return () => { mounted = false; close?.(); };
-    }, [controller, id, retry, running, sessionId]);
+    }, [controller, id, retry, watching, sessionId]);
 
     return h('article', { className: 'dsh-btw-card', 'aria-label': t('title') },
       h('header', { className: 'dsh-btw-card-bar' },
@@ -942,7 +943,7 @@ export function createViews(React) {
       expanded && h('div', { className: 'dsh-btw-inline-rule', 'aria-hidden': true }),
       h('div', { id: contentId, hidden: !expanded, className: expanded ? 'dsh-btw-inline-reply' : undefined }, expanded && h(Fragment, null,
         firstTurn && h(Reply, { turn: firstTurn, t, renderFactorySlot, inline: true, streamFailed: failed }),
-        running && failed && h(Feedback, { text: t('streamFailed'), t, inline: true, error: true,
+        (running || firstTurn?.saveError) && failed && h(Feedback, { text: t('streamFailed'), t, inline: true, error: true,
           onRetry: () => setRetry(value => value + 1) }))));
   }
 

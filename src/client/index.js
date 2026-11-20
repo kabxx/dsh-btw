@@ -262,7 +262,7 @@ export function makeController(ctx) {
     async call(name, ...args) { return unwrap(await ctx.remote.btw[name](...args)) },
     watch(sessionId, id, onNext, onError) {
       return observe(signal => ctx.remote.btw.watch(sessionId, id, null, signal),
-        detail => detail.turns.at(-1)?.status !== 'generating', onNext, onError)
+        detail => detail.turns.at(-1)?.status !== 'generating' && !detail.turns[0]?.saveError, onNext, onError)
     },
     watchThread(sessionId, id, onNext, onError) {
       const stream = ctx.remote.$stream({

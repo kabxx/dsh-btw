@@ -969,6 +969,93 @@ test('native Responses reuses the main cache key only at transport, including af
   }
 })
 
+test('a failed checkpoint is retried without any new model output', { timeout: 5_000 }, async t => {
+  const llm = controlledModel()
+  const domain = memoryStore()
+  const openArchive = domain.open
+  const savedCheckpoint = Promise.withResolvers()
+  const versions = []
+  domain.open = async sessionId => {
+    const archive = await openArchive(sessionId)
+    return { ...archive, async put(record) {
+      if (latest(record).status === 'generating' && latest(record).reply) {
+        versions.push(record.version)
+        if (versions.length === 1) throw new Error('temporary archive failure')
+        await archive.put(record)
+        savedCheckpoint.resolve(record)
+        return
+      }
+      await archive.put(record)
+    } }
+  }
+  const host = new BtwHost({ store: domain, llm })
+  try {
+    const { id, sessionId, version } = await host.create(makeAgent('session-checkpoint-retry'), 'first')
+    const call = await llm.waitForCount(1)
+    const watch = host.watch(sessionId, id, version, () => {})
+    const preview = watch.next()
+    call.emit(text('visible fragment'))
+    assert.equal(latest((await preview).value).reply, 'visible fragment')
+    await watch.return()
+
+    // The model remains paused after its first fragment while the checkpoint is retried.
+    const timedOut = new Promise((_, reject) => {
+      t.signal.addEventListener('abort', () => reject(t.signal.reason), { once: true })
+    })
+    const stored = await Promise.race([savedCheckpoint.promise, timedOut])
+    assert.deepEqual(versions, [stored.version, stored.version])
+    assert.equal(latest(domain.saved.get(id)).reply, 'visible fragment')
+    assert.equal(latest(domain.saved.get(id)).status, 'generating')
+    assert.equal(call.options.signal.aborted, false)
+  } finally {
+    await host.close()
+  }
+})
+
+test('a completed reply is saved after a temporary terminal write failure', { timeout: 5_000 }, async t => {
+  const llm = controlledModel()
+  const domain = memoryStore()
+  const openArchive = domain.open
+  let attempts = 0
+  domain.open = async sessionId => {
+    const archive = await openArchive(sessionId)
+    return { ...archive, async put(record) {
+      if (latest(record).status === 'completed' && ++attempts === 1) throw new Error('terminal write temporarily unavailable')
+      await archive.put(record)
+    } }
+  }
+  const host = new BtwHost({ store: domain, llm })
+  const watchers = new AbortController()
+  t.signal.addEventListener('abort', () => watchers.abort(), { once: true })
+  try {
+    const { id, sessionId, version } = await host.create(makeAgent('terminal-save-retry'), 'question')
+    const call = await llm.waitForCount(1)
+    const card = host.watch(sessionId, id, version, () => {}, watchers.signal)
+    const sidebar = host.watchThread(sessionId, id, () => {}, watchers.signal)
+    let detail = (await sidebar.next()).value.detail
+    const failedCard = (async () => {
+      let item
+      do { item = (await card.next()).value } while (latest(item).status === 'generating')
+      return item
+    })()
+    call.emit(text('complete answer'))
+    call.emit(finish())
+    assert.equal(latest(await failedCard).saveError, 'archive-write-failed')
+    assert.equal(latest(domain.saved.get(id)).reply, '')
+    while (!latest(detail).saveError) detail = applyThreadEvent(detail, (await sidebar.next()).value)
+    const [recoveredCard, recoveredEvent] = await Promise.all([card.next(), sidebar.next()])
+    detail = applyThreadEvent(detail, recoveredEvent.value)
+    assert.equal(latest(recoveredCard.value).saveError, undefined)
+    assert.equal(latest(detail).saveError, undefined)
+    assert.equal(latest(detail).status, 'completed')
+    assert.equal(latest(domain.saved.get(id)).reply, 'complete answer')
+    assert.equal(attempts, 2)
+  } finally {
+    watchers.abort()
+    await host.close()
+  }
+})
+
 test('archive failure leaves the answer visible and failed attempt content does not replay', { timeout: 10_000 }, async () => {
   const llm = controlledModel()
   const domain = memoryStore()

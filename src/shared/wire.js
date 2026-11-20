@@ -115,11 +115,12 @@ function parsePosition(value) {
 
 export function applyReply(detail, turnIndex, update) {
   const turn = detail.turns[turnIndex]
-  if (!turn || turn.status !== 'generating' || update.version <= detail.version) return detail
+  if (!turn || (turn.status !== 'generating' && !turn.saveError) || update.version <= detail.version) return detail
+  const { saveError, ...previous } = turn
   checked(update.offset, update.offset <= turn.reply.length, 'reply offset')
   const turns = [...detail.turns]
   turns[turnIndex] = {
-    ...turn, reply: turn.reply.slice(0, update.offset) + update.text, status: update.status,
+    ...previous, reply: turn.reply.slice(0, update.offset) + update.text, status: update.status,
     ...(update.finishedAt !== undefined && { finishedAt: update.finishedAt }),
     ...(update.error !== undefined && { error: update.error }),
     ...(update.saveError !== undefined && { saveError: update.saveError }),

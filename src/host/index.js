@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 import {
   CONTEXT_OVERFLOW, PACKAGE_NAME, TOKEN_FIELDS, contextDescriptor, parseDetail, parseQuestion, parseSessionId, parseThreadId, parseVersion, threadDescriptor,
@@ -381,6 +382,7 @@ export class BtwHost {
     this.opening = new Set()
     this.running = new Set()
     this.admissions = new Set()
+    this.archiveRetries = new Set()
     this.lifetime = new AbortController()
   }
 
@@ -393,7 +395,7 @@ export class BtwHost {
       state = undefined
     }
     if (!state) {
-      state = { owner, controller: new AbortController(), records: new Map() }
+      state = { owner, controller: new AbortController(), records: new Map(), terminalWrites: new Map() }
       // AgentLoop disposes the agent scope before closing the session write handle.
       state.disposeOwner = owner?.ctx?.effect(() => () => {
         state.disposeOwner = undefined
@@ -446,7 +448,7 @@ export class BtwHost {
       } catch {
         if (state.controller.signal.aborted) break
         this.logger?.error('BTW could not save a recovered reply')
-        this.publish(withLatest(terminal, { ...newest(terminal), saveError: ARCHIVE_ERROR }, time), false, state)
+        this.retryTerminalSave(terminal, state)
       }
     }
   }
@@ -463,6 +465,37 @@ export class BtwHost {
     state.controller.signal.throwIfAborted()
     const turns = record.turns.map(({ saveError, ...turn }) => turn)
     await state.archive.put(threadSchema.parse({ ...record, turns }), state.controller.signal)
+  }
+
+  retryTerminalSave(terminal, state) {
+    const time = terminal.updatedAt
+    const failed = withLatest(terminal, { ...newest(terminal), saveError: ARCHIVE_ERROR }, time)
+    const recovered = withLatest(failed, newest(terminal), time)
+    this.publish(failed, true, state)
+    const signal = AbortSignal.any([state.controller.signal, this.lifetime.signal])
+    const retry = (async () => {
+      while (!signal.aborted && state.records.get(failed.id) === failed) {
+        try { await delay(CHECKPOINT_INTERVAL_MS, undefined, { signal, ref: false }) }
+        catch { return }
+        if (state.records.get(failed.id) !== failed) return
+        if (this.runs.get(failed.id)?.state === state) continue
+        const write = this.save(recovered, state)
+        state.terminalWrites.set(failed.id, write)
+        try {
+          await write
+          if (this.runs.get(failed.id)?.state !== state) {
+            this.publish(recovered, true, state)
+            return
+          }
+        } catch {
+          // Keep the latest answer eligible for the next archive check.
+        } finally {
+          state.terminalWrites.delete(failed.id)
+        }
+      }
+    })()
+    this.archiveRetries.add(retry)
+    retry.then(() => this.archiveRetries.delete(retry), () => this.archiveRetries.delete(retry))
   }
 
   read(sessionId, id) {
@@ -549,7 +582,8 @@ export class BtwHost {
     if (this.runs.get(id)?.state === this.sessions.get(sessionId) || !isDone(record)) throw fault('generating', '上一条回复仍在生成。')
     if (newest(record).error === CONTEXT_OVERFLOW) throw fault('context-overflow', '已达上下文上限。')
     const time = Math.max(Date.now(), record.updatedAt)
-    return this.admit(nextRevision(record, [...record.turns, nextTurn(question, time)], time), admitted => {
+    const turns = record.turns.map(({ saveError, ...turn }) => turn)
+    return this.admit(nextRevision(record, [...turns, nextTurn(question, time)], time), admitted => {
       const { usage, ...turn } = publicTurn(newest(admitted))
       return { id, sessionId, updatedAt: admitted.updatedAt, version: admitted.version, turnIndex: admitted.turns.length - 1, turn }
     })
@@ -560,7 +594,7 @@ export class BtwHost {
     const state = this.sessions.get(record.sessionId)
     const run = { controller, state }
     this.runs.set(record.id, run)
-    const admission = this.save(record, state).then(() => {
+    const admission = Promise.resolve(state.terminalWrites.get(record.id)).catch(() => {}).then(() => this.save(record, state)).then(() => {
       state.controller.signal.throwIfAborted()
       this.publish(record, true, state)
       // Start only after durable admission. No caller/transport signal is inherited.
@@ -604,8 +638,9 @@ export class BtwHost {
     const checkpointTimer = setInterval(() => {
       if (pendingSave || checkpointVersion === current.version || signal.aborted) return
       const checkpoint = current
-      checkpointVersion = checkpoint.version
-      pendingSave = this.save(checkpoint, state).catch(() => {
+      pendingSave = this.save(checkpoint, state).then(() => {
+        checkpointVersion = checkpoint.version
+      }).catch(() => {
         this.logger?.error('BTW could not save a reply checkpoint')
       }).finally(() => { pendingSave = undefined })
     }, CHECKPOINT_INTERVAL_MS)
@@ -688,7 +723,7 @@ export class BtwHost {
     } catch {
       this.logger?.error('BTW could not save a terminal reply')
       releaseRun()
-      this.publish(withLatest(terminal, { ...newest(terminal), saveError: ARCHIVE_ERROR }, time), true, state)
+      if (!state.controller.signal.aborted) this.retryTerminalSave(terminal, state)
     }
   }
 
@@ -704,7 +739,7 @@ export class BtwHost {
         version = record.version
         yield toDetail(record)
       }
-      if (isDone(record)) return
+      if (isDone(record) && !record.turns[0].saveError) return
       // If a revision arrived while the generator was yielding, reread promptly.
       if (this.read(sessionId, id).version !== version) continue
       try {
@@ -731,7 +766,10 @@ export class BtwHost {
       }
       if (record.version !== previous.version) {
         const firstTurn = previous.turns.length
-        const reply = isDone(previous) ? undefined : replyDelta(newest(previous).reply, record.turns[firstTurn - 1])
+        const oldTurn = newest(previous)
+        const updatedTurn = record.turns[firstTurn - 1]
+        const reply = !isDone(previous) || oldTurn.saveError !== updatedTurn.saveError
+          ? replyDelta(oldTurn.reply, updatedTurn) : undefined
         previous = record
         yield {
           kind: 'change', version: record.version, updatedAt: record.updatedAt, firstTurn,
@@ -783,6 +821,7 @@ export class BtwHost {
     await Promise.allSettled([...this.admissions])
     await Promise.allSettled([...this.running])
     await Promise.allSettled([...this.opening.values()])
+    await Promise.allSettled([...this.archiveRetries])
     await Promise.allSettled([...this.sessions].map(([id, state]) => this.retire(id, state.owner)))
   }
 }
