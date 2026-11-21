@@ -48,7 +48,17 @@ function harness() {
       openTabs.set(inventory())
     },
   }
-  return { sidebarRight, mounted, files, remote: { btw: {} } }
+  const events = new Map()
+  return {
+    sidebarRight, mounted, files, remote: { btw: {} },
+    on(event, listener) {
+      const listeners = events.get(event) ?? new Set()
+      events.set(event, listeners)
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+    emit(event) { for (const listener of events.get(event) ?? []) listener() },
+  }
 }
 
 test('usage follows the main chat cache buckets and keeps genuinely unknown usage absent', () => {
@@ -552,6 +562,99 @@ test('a card restores on return and page reopen until dismissed or moved to the 
     assert.deepEqual(afterMove.getSnapshot().cards, {})
   } finally {
     for (const controller of controllers) controller.dispose()
+    if (descriptor) Object.defineProperty(globalThis, 'localStorage', descriptor)
+    else delete globalThis.localStorage
+  }
+})
+
+test('a remembered card restores on reconnect whether the first read already failed or is still pending', async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+  const detail = { id: 'remembered', sessionId: 'main' }
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+    getItem: key => key === 'dsh.btw.card.main' ? detail.id : null,
+  } })
+  try {
+    for (const reconnectBeforeFailure of [false, true]) {
+      const ctx = harness()
+      const interrupted = Promise.withResolvers()
+      let reads = 0
+      ctx.remote.btw.get = (sessionId, id) => {
+        assert.equal(sessionId, 'main')
+        assert.equal(id, detail.id)
+        reads += 1
+        return reads === 1 ? interrupted.promise : Promise.resolve({ ok: true, value: detail })
+      }
+      const controller = makeController(ctx)
+      try {
+        const firstRestore = controller.restoreCard('main')
+        assert.equal(controller.restoreCard('main'), firstRestore)
+        await flush()
+        assert.equal(reads, 1)
+        if (reconnectBeforeFailure) ctx.emit('connection/reset')
+        interrupted.reject(new Error('connection lost'))
+        await firstRestore
+        if (!reconnectBeforeFailure) {
+          assert.deepEqual(controller.getSnapshot().cards, {})
+          assert.equal(reads, 1)
+          ctx.emit('connection/reset')
+        }
+        // Two simultaneous notifications may share the same restore read.
+        ctx.emit('connection/reset')
+        await flush()
+        await flush()
+        assert.equal(controller.getSnapshot().cards.main, detail)
+        assert.equal(reads, 2)
+        assert.equal(controller.getSnapshot().pane, null)
+        controller.dismiss('main', detail.id)
+        ctx.emit('connection/reset')
+        await flush()
+        assert.equal(reads, 2)
+        assert.deepEqual(controller.getSnapshot().cards, {})
+      } finally {
+        controller.dispose()
+      }
+      ctx.emit('connection/reset')
+      await flush()
+      assert.equal(reads, 2)
+    }
+  } finally {
+    if (descriptor) Object.defineProperty(globalThis, 'localStorage', descriptor)
+    else delete globalThis.localStorage
+  }
+})
+
+test('a reconnect read cannot restore a stale card after a session switch or a replacement', async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+    getItem: key => key === 'dsh.btw.card.main' ? 'older' : null,
+  } })
+  try {
+    for (const replace of [false, true]) {
+      const ctx = harness()
+      const found = Promise.withResolvers()
+      ctx.remote.btw.get = () => found.promise
+      const newer = { sessionId: 'main', id: 'newer' }
+      ctx.remote.btw.submitCreate = async () => ({ ok: true, value: newer })
+      const controller = makeController(ctx)
+      try {
+        ctx.emit('connection/reset')
+        const pending = controller.restoreCard('main')
+        await flush()
+        if (replace) {
+          await controller.createCard('main', 'new question')
+          controller.dismiss('main', newer.id)
+        } else {
+          ctx.mounted.set('other')
+          ctx.mounted.set('main')
+        }
+        found.resolve({ ok: true, value: { sessionId: 'main', id: 'older' } })
+        await pending
+        assert.deepEqual(controller.getSnapshot().cards, {})
+      } finally {
+        controller.dispose()
+      }
+    }
+  } finally {
     if (descriptor) Object.defineProperty(globalThis, 'localStorage', descriptor)
     else delete globalThis.localStorage
   }

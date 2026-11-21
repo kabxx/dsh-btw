@@ -57,6 +57,7 @@ export function makeController(ctx) {
   }
   let session = sidebar.mounted.getSnapshot()
   let selectionRevision = 0
+  let restoreAttempt
   const panes = new Map()
   const cardIds = new Map()
   const lastAcceptedCards = new Map()
@@ -141,21 +142,40 @@ export function makeController(ctx) {
     publish({ cards })
   }
 
-  async function restoreCard(sessionId) {
+  function restoreCard(sessionId, reconnected = false) {
     if (disposed || sessionId === undefined || session !== sessionId || snapshot.cards[sessionId]) return
     const id = cardIdFor(sessionId)
     if (!id) return
     const revision = selectionRevision
-    const stillCurrent = () => !disposed && selectionRevision === revision && cardIdFor(sessionId) === id
-    try {
-      const detail = unwrap(await ctx.remote.btw.get(sessionId, id))
-      if (stillCurrent() && detail.id === id && detail.sessionId === sessionId && !snapshot.cards[sessionId]) {
-        publish({ cards: { ...snapshot.cards, [sessionId]: detail } })
-      }
-    } catch (error) {
-      if (stillCurrent() && error.code === 'btw/not-found') forgetCard(sessionId, id)
+    if (restoreAttempt?.revision === revision && restoreAttempt.id === id) {
+      if (reconnected) restoreAttempt.retryOnFailure = true
+      return restoreAttempt.promise
     }
+    const attempt = { revision, id, retryOnFailure: false }
+    restoreAttempt = attempt
+    const stillCurrent = () => !disposed && selectionRevision === revision && cardIdFor(sessionId) === id
+    attempt.promise = Promise.resolve().then(async () => {
+      let failed = false
+      try {
+        if (!stillCurrent()) return
+        const detail = unwrap(await ctx.remote.btw.get(sessionId, id))
+        if (stillCurrent() && detail.id === id && detail.sessionId === sessionId && !snapshot.cards[sessionId]) {
+          publish({ cards: { ...snapshot.cards, [sessionId]: detail } })
+        }
+      } catch (error) {
+        if (!stillCurrent()) return
+        if (error?.code === 'btw/not-found') forgetCard(sessionId, id)
+        else failed = true
+      } finally {
+        if (restoreAttempt === attempt) restoreAttempt = undefined
+      }
+      // The reconnect can arrive before the failed request has settled.
+      if (failed && attempt.retryOnFailure && stillCurrent()) await restoreCard(sessionId)
+    })
+    return attempt.promise
   }
+
+  const disposeConnection = ctx.on('connection/reset', () => { void restoreCard(session, true) })
 
   const disposeSelection = sidebar.mounted.subscribe(() => {
     const current = sidebar.mounted.getSnapshot()
@@ -353,6 +373,7 @@ export function makeController(ctx) {
     },
     dispose() {
       disposed = true
+      disposeConnection()
       disposeSelection()
       disposeInventory()
       closeTabs(session)
