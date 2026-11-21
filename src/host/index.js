@@ -540,24 +540,26 @@ export class BtwHost {
     const record = this.read(sessionId, id)
     const price = messages => messages.reduce((sum, message) => sum + estimateMessage(message), 0)
     const snapshot = record.snapshot
+    const messages = requestMessages(record, true)
+    const promptFields = ['inputTokens', 'cacheReadTokens', 'cacheWriteTokens']
+    const anchor = record.turns.findLastIndex(({ status, usage }) => {
+      // A failed attempt can report zeroed usage without measuring the prompt.
+      if (status === 'failed') return promptFields.some(field => usage?.[field] > 0)
+      return promptFields.some(field => usage?.[field] !== undefined)
+    })
+    if (anchor !== -1) {
+      // Provider usage describes the input before this turn's assistant reply.
+      const usage = record.turns[anchor].usage
+      const reported = promptFields.reduce((sum, field) => sum + (usage[field] ?? 0), 0)
+      const sampledPrompt = requestMessages({ ...record, turns: record.turns.slice(0, anchor + 1) })
+      return { contextWindow: capacity, estimatedTokens: reported + price(messages.slice(sampledPrompt.length)) }
+    }
     const schemaTokens = estimateToolsTokens({ tools: snapshot.tools })
     const systemTokens = snapshot.system
       ? estimateMessage({ role: 'system', content: [{ type: 'text', text: snapshot.system }] }) : 0
-    const overhead = schemaTokens + systemTokens
-    const fullEstimate = price(requestMessages(record, true)) + overhead
-    const promptFields = ['inputTokens', 'cacheReadTokens', 'cacheWriteTokens']
-    const anchor = record.turns.findIndex(({ usage }) => promptFields.some(field => usage?.[field] !== undefined))
-    const nativeAdjustment = snapshot.measuredPrefix !== undefined
-      ? snapshot.measuredPrefix - (price(snapshot.messages) + overhead) : 0
-    let usageAdjustment = 0
-    if (anchor !== -1) {
-      const reported = promptFields.reduce((sum, field) => sum + (record.turns[anchor].usage[field] ?? 0), 0)
-      const promptEstimate = price(requestMessages({ ...record, turns: record.turns.slice(0, anchor + 1) })) + overhead
-      usageAdjustment = reported - promptEstimate
-    }
-    // Fixed native measurements and assistant-context deltas coexist with the
-    // first side-request sample. Newer billing reports do not reset the meter.
-    return { contextWindow: capacity, estimatedTokens: fullEstimate + Math.max(0, nativeAdjustment, usageAdjustment) }
+    const estimatedPrefix = price(snapshot.messages) + schemaTokens + systemTokens
+    const prefixTokens = Math.max(estimatedPrefix, snapshot.measuredPrefix ?? 0)
+    return { contextWindow: capacity, estimatedTokens: prefixTokens + price(messages.slice(snapshot.messages.length)) }
   }
 
   async create(agent, question, signal, submissionId) {
