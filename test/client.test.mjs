@@ -5,7 +5,7 @@ import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { inject, makeController, makeSource, mountClient, observeSpeech } from '../src/client/index.js'
 import { applyThreadEvent, applyReply, parseSessionId, parseTurn } from '../src/shared/wire.js'
-import { contextReading, createCompositionGuard, formatMessageTime, formatTokenCount, orderHistory, summarizeUsage } from '../src/client/views.js'
+import { contextReading, createCompositionGuard, formatMessageTime, formatTokenCount, isFollowupSubmitKey, orderHistory, summarizeUsage } from '../src/client/views.js'
 import zh from '../locale/zh.json' with { type: 'json' }
 import en from '../locale/en.json' with { type: 'json' }
 
@@ -106,6 +106,19 @@ test('a late Safari composition confirmation cannot submit the draft', () => {
   assert.ok(!guard.blocksSubmit(enter));
   assert.ok(guard.blocksSubmit({ ...enter, keyCode: 229 }));
   assert.ok(guard.blocksSubmit({ ...enter, nativeEvent: { isComposing: true } }));
+})
+
+test('follow-up Enter leaves application shortcuts and plain Shift+Enter to DSH', () => {
+  const enter = { key: 'Enter' }
+  for (const modifiers of [
+    { altKey: true }, { ctrlKey: true, altKey: true }, { getModifierState: key => key === 'AltGraph' },
+    { ctrlKey: true, metaKey: true }, { shiftKey: true, ctrlKey: true }, { shiftKey: true, metaKey: true },
+    { shiftKey: true },
+  ]) assert.equal(isFollowupSubmitKey({ ...enter, ...modifiers }), false)
+  for (const modifiers of [{}, { ctrlKey: true }, { metaKey: true }]) {
+    assert.equal(isFollowupSubmitKey({ ...enter, ...modifiers }), true)
+  }
+  assert.equal(isFollowupSubmitKey({ key: 'Escape' }), false)
 })
 
 test('sidebar formats token counts and clocks like the host and renders the estimated context separately', () => {

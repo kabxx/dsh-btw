@@ -592,6 +592,12 @@ export function createCompositionGuard(now = Date.now) {
   };
 }
 
+export function isFollowupSubmitKey(event) {
+  // Match the DSH composer: application shortcuts keep their Enter gesture.
+  return event.key === 'Enter' && !event.shiftKey && !event.altKey &&
+    !event.getModifierState?.('AltGraph') && !(event.ctrlKey && event.metaKey);
+}
+
 export function summarizeUsage(turns) {
   let uncached = 0;
   let cacheRead = 0;
@@ -1287,7 +1293,7 @@ export function createViews(React) {
         event.stopPropagation();
         dictation.cancel();
       }
-      if (locked || event.key !== 'Enter' || event.shiftKey || composition.blocksSubmit(event)) return;
+      if (locked || !isFollowupSubmitKey(event) || composition.blocksSubmit(event)) return;
       event.preventDefault();
       if (!sendBlocked && !event.repeat) form.current?.requestSubmit();
     }
