@@ -792,7 +792,12 @@ test('speech readiness follows native reconnects and reopens an ended readiness 
     providers: [{ id: providerId, preparation: { phase: 'ready' } }],
   })
   const signals = []
+  const transcriptions = []
   const speech = {
+    async transcribe(request) {
+      transcriptions.push(request)
+      return { ok: true, value: { text: 'recorded during reconnection' } }
+    },
     async *follow(signal) {
       signals.push(signal)
       if (signals.length === 1) {
@@ -818,16 +823,20 @@ test('speech readiness follows native reconnects and reopens an ended readiness 
   const stop = observeSpeech({ speech, $stream: options => new RemoteStream({ generation }, options) }, controller)
   try {
     await waitFor(() => controller.beginDictation()?.maxDurationSeconds === 31)
+    const activeRecording = controller.beginDictation()
     generation.set(undefined)
     const fellOffline = waitFor(() => !controller.getSnapshot().dictationAvailable)
     disconnected.resolve()
     await fellOffline
     assert.equal(controller.getSnapshot().speechMounted, true)
+    assert.equal(controller.beginDictation(), undefined)
     assert.equal(signals.length, 1)
     const recovered = waitFor(() => controller.beginDictation()?.maxDurationSeconds === 73)
     generation.set({})
     await recovered
     assert.equal(signals.length, 2)
+    assert.equal(await activeRecording.transcribe(new Blob(['audio']), new AbortController().signal), 'recorded during reconnection')
+    assert.deepEqual(transcriptions, [{ providerId: 'before', audioBase64: 'YXVkaW8=' }])
     const reopened = waitFor(() => controller.beginDictation()?.maxDurationSeconds === 89)
     hostClosed.resolve()
     await reopened

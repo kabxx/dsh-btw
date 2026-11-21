@@ -1100,7 +1100,7 @@ export function createViews(React) {
     }));
   }
 
-  function useDictation(enabled, controller, insert) {
+  function useDictation(locked, controller, insert) {
     const active = useRef(null);
     const [phase, setPhase] = useState('');
     const stop = useCallback(() => {
@@ -1110,8 +1110,9 @@ export function createViews(React) {
       releaseCapture(capture);
     }, []);
     const cancel = useCallback(() => { stop(); setPhase(''); }, [stop]);
+    // Capture belongs to the composer, even while the speech service reconnects.
     useEffect(() => {
-      if (!enabled) { cancel(); return undefined; }
+      if (locked) { cancel(); return undefined; }
       const blur = () => { if (active.current?.phase === 'micRecording') cancel(); };
       const visibility = () => {
         if (document.hidden && active.current && active.current.phase !== 'micTranscribing') cancel();
@@ -1128,7 +1129,7 @@ export function createViews(React) {
         document.removeEventListener('keydown', escape);
         stop();
       };
-    }, [enabled, cancel, stop]);
+    }, [locked, cancel, stop]);
 
     async function finish(capture) {
       if (active.current !== capture || capture.phase !== 'micRecording') return;
@@ -1162,7 +1163,7 @@ export function createViews(React) {
     }
 
     async function toggle(selection) {
-      if (!enabled) return;
+      if (locked) return;
       if (active.current) {
         if (active.current.phase === 'micRecording') await finish(active.current);
         return;
@@ -1244,7 +1245,7 @@ export function createViews(React) {
     const canRecord = typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices?.getUserMedia) &&
       typeof MediaRecorder !== 'undefined' && typeof OfflineAudioContext !== 'undefined';
     const locked = overflowed || error === 'contextOverflow';
-    const dictation = useDictation(!locked && dictationAvailable && canRecord, controller, insertSpeech);
+    const dictation = useDictation(locked, controller, insertSpeech);
     useEffect(() => {
       if (dictationAvailable) setMicHelp(current => current === 'micSetup' ? '' : current);
     }, [dictationAvailable]);
@@ -1307,6 +1308,10 @@ export function createViews(React) {
 
     function toggleMic() {
       if (locked || saving) return;
+      if (dictation.phase === 'micRecording') {
+        void dictation.toggle();
+        return;
+      }
       if (!dictationAvailable) {
         setMicHelp(current => current === 'micSetup' ? '' : 'micSetup');
         return;
@@ -1348,7 +1353,7 @@ export function createViews(React) {
         }),
         h('div', { className: 'dsh-btw-form-actions' },
           !locked && dictating && h(IconButton, { icon: 'close', label: t('micCancel'), onClick: dictation.cancel }),
-          speechMounted && h(IconButton, {
+          (speechMounted || dictating) && h(IconButton, {
             className: 'dsh-btw-mic', icon: dictation.phase === 'micRecording' ? 'stop' : 'mic',
             label: t(dictation.phase === 'micRecording' ? 'micStop' : dictationAvailable ? 'micStart' : 'micSettings'),
             disabled: locked || saving || dictation.phase === 'micRequesting' || dictation.phase === 'micTranscribing',
