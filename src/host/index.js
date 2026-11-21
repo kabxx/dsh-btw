@@ -318,6 +318,19 @@ async function* streamSideQuestion(llm, options, record) {
   })
 }
 
+function replyText(blocks) {
+  return blocks.filter(block => block.type === 'text').map(block => block.text).join('')
+}
+
+function previewReply(assembler) {
+  try {
+    return replyText(assembler.blocks())
+  } catch {
+    // An open provider-specific block may not be assemblable until it closes.
+    return replyText(assembler.interruptedBlocks())
+  }
+}
+
 function modelReplyFor(record, assembler, interrupted) {
   const received = interrupted ? assembler.interruptedBlocks() : assembler.blocks()
   const content = received.filter(block => block.type === 'text' || block.type === 'reasoning')
@@ -715,7 +728,7 @@ export class BtwHost {
           break
         }
         if (chunk.type !== 'text-delta' && !(chunk.type === 'block-end' && chunk.block.type === 'text')) continue
-        const reply = assembler.interruptedBlocks().filter(block => block.type === 'text').map(block => block.text).join('')
+        const reply = previewReply(assembler)
         const time = Date.now()
         current = withLatest(current, { ...newest(current), reply }, time)
         this.publish(current, false, state)
@@ -752,9 +765,13 @@ export class BtwHost {
     if (signal.aborted || !error) {
       try { modelReply = modelReplyFor(record, assembler, signal.aborted) } catch { error = FAILURE }
     }
+    const reply = error
+      ? replyText(assembler.interruptedBlocks())
+      : replyText(modelReply?.content ?? [])
     const usage = readUsage(assembler.usage)
     const terminal = withLatest(current, {
       ...turn,
+      reply,
       status: interrupted ? 'interrupted' : error ? 'failed' : 'completed',
       ...(!interrupted && !error && finish === 'max-tokens' && { outputLimitReached: true }),
       finishedAt: time,

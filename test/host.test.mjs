@@ -724,6 +724,47 @@ test('output limit keeps a completed reply, reaches the sidebar, and survives re
   } finally { await host.close() }
 })
 
+test('independent whitespace blocks survive streaming, archiving and follow-up replay', { timeout: 5000 }, async () => {
+  const store = memoryStore()
+  const llm = controlledModel()
+  const agent = makeAgent('session-reply-whitespace')
+  const host = new BtwHost({ store, llm })
+  try {
+    const { id, sessionId } = await host.create(agent, 'Show the instruction in two paragraphs')
+    const card = host.watch(sessionId, id, undefined, () => {})
+    const expected = '注意\n\n不要关闭电源'
+    try {
+      await card.next()
+      const call = await llm.waitForCount(1)
+      call.emit(text('注意'))
+      assert.equal(latest((await card.next()).value).reply, '注意')
+      for (const [index, value] of ['注意', '\n\n', '不要关闭电源'].entries()) {
+        call.emit({ type: 'block-end', index, block: { type: 'text', text: value } })
+      }
+      const preview = latest((await card.next()).value)
+      assert.equal(preview.status, 'generating')
+      assert.equal(preview.reply, expected)
+      call.emit(finish())
+      const done = latest((await card.next()).value)
+      assert.equal(done.status, 'completed')
+      assert.equal(done.reply, expected)
+      assert.equal(latest(store.saved.get(id)).reply, expected)
+    } finally { await card.return() }
+
+    await host.followup(sessionId, id, 'repeat')
+    const followup = await llm.waitForCount(2)
+    const assistant = followup.options.messages.find(message => message.role === 'assistant')
+    assert.deepEqual(assistant.content.map(block => block.text), ['注意', '\n\n', '不要关闭电源'])
+    const interrupted = terminal(host.watch(sessionId, id, undefined, () => {}))
+    followup.emit(text('partial', 0))
+    followup.emit(text('\n\n', 1))
+    followup.emit(finish('aborted'))
+    const stopped = latest(await interrupted)
+    assert.equal(stopped.status, 'interrupted')
+    assert.equal(stopped.reply, 'partial')
+  } finally { await host.close() }
+})
+
 test('native reply failures expose only known codes and never provider diagnostics', async () => {
   const host = new BtwHost({
     store: memoryStore(),
