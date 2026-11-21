@@ -590,7 +590,7 @@ export class BtwHost {
     if (submissionId !== undefined) parseSubmissionId(submissionId)
     const sessionId = parseSessionId(agent.session.id)
     if (!await this.prepare(sessionId, signal, agent)) {
-      throw fault('session-not-saved', '请先发送一条消息开始侧问')
+      throw fault('session-not-saved', '请先发送一条消息后再发起侧问。')
     }
     const state = this.sessions.get(sessionId)
     if (submissionId !== undefined) {
@@ -961,13 +961,13 @@ export default class BtwService extends TypertRemoteService {
 
   async create(agent, question, signal) {
     const { available } = await this.prepare(agent, signal)
-    if (!available) throw fault('session-not-saved', '请先发送一条消息开始侧问')
+    if (!available) throw fault('session-not-saved', '请先发送一条消息后再发起侧问。')
     return this.host.create(agent, question, signal)
   }
 
   async submitCreate(agent, question, submissionId, signal) {
     const { available } = await this.prepare(agent, signal)
-    if (!available) throw fault('session-not-saved', '请先发送一条消息开始侧问')
+    if (!available) throw fault('session-not-saved', '请先发送一条消息后再发起侧问。')
     return this.host.create(agent, question, signal, submissionId)
   }
 

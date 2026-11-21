@@ -391,7 +391,7 @@ test('a missing follow-up snapshot tells the user to start a new side question',
     controller.setDraft('main', 'thread', 'still unsent')
     await assert.rejects(controller.submitDraft('main', 'thread'), { code: 'btw/snapshot-unavailable' })
     const draft = controller.getDraft('main', 'thread')
-    assert.equal(zh.ui[draft.error], '侧问上下文已失效。请发起新的侧问。')
+    assert.equal(zh.ui[draft.error], '侧问上下文已失效，请发起新的侧问。')
     assert.equal(en.ui[draft.error], 'The context for this side question is unavailable. Start a new side question.')
     assert.equal(draft.text, 'still unsent')
     assert.equal(draft.saving, false)
