@@ -6,6 +6,8 @@ export const NATIVE_FAILURE_DETAILS = Object.freeze({
   AUTH: 'invalidApiKey',
   QUOTA: 'quotaExhausted',
   ACCOUNT_QUOTA: 'quotaExhausted',
+  RATE_LIMIT: 'rateLimited',
+  CONTENT_REFUSED: 'contentRefused',
 })
 const STATUSES = new Set(['generating', 'completed', 'failed', 'interrupted'])
 export const TOKEN_FIELDS = ['inputTokens', 'outputTokens', 'totalTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens']

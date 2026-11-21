@@ -39,6 +39,8 @@
     "accountSignInRequired": "Sign in to DeepSeek and ensure the request destination supports account authentication.",
     "invalidApiKey": "API key is invalid",
     "quotaExhausted": "Request quota exhausted.",
+    "rateLimited": "Too many requests. Try again later.",
+    "contentRefused": "The model declined to answer. Try rephrasing your question.",
     "emptyReply": "No text response.",
     "history": "Side question messages",
     "userMessage": "You",

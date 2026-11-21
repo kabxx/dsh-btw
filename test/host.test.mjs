@@ -913,14 +913,16 @@ test('native reply failures expose only known codes and never provider diagnosti
       async *stream(options) {
         const code = options.messages.at(-1).content[0].text.split('\n').at(-1)
         const failure = { code, message: 'private provider diagnostic' }
-        if (code === 'AUTH') throw Object.assign(new Error(failure.message), { code })
+        if (code === 'AUTH' || code === 'CONTENT_REFUSED') {
+          throw Object.assign(new Error(failure.message), { code })
+        }
         yield { type: 'finish', reason: { kind: 'error', failure } }
       },
     },
   })
   const agent = makeAgent('session-native-failures')
   try {
-    for (const code of ['AUTH', 'ACCOUNT_SIGNED_OUT', 'ACCOUNT_SIGN_IN_REQUIRED', 'QUOTA', 'ACCOUNT_QUOTA', 'PROVIDER_PRIVATE_CODE']) {
+    for (const code of ['AUTH', 'ACCOUNT_SIGNED_OUT', 'ACCOUNT_SIGN_IN_REQUIRED', 'QUOTA', 'ACCOUNT_QUOTA', 'RATE_LIMIT', 'CONTENT_REFUSED', 'PROVIDER_PRIVATE_CODE']) {
       const { id, sessionId } = await host.create(agent, code)
       const turn = latest(await terminal(host.watch(sessionId, id, undefined, () => {})))
       assert.equal(turn.status, 'failed')

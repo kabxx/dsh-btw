@@ -39,6 +39,8 @@
     "accountSignInRequired": "请先登录 DeepSeek，并确认请求地址支持账号认证。",
     "invalidApiKey": "API 密钥无效",
     "quotaExhausted": "当前请求的额度已用尽",
+    "rateLimited": "请求受到限流，请稍后重试。",
+    "contentRefused": "模型拒绝回答。请调整问题后再试。",
     "emptyReply": "模型未返回文本内容。",
     "history": "侧问对话记录",
     "userMessage": "你",
