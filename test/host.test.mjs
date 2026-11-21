@@ -49,7 +49,8 @@ async function sessionFolder(t) {
   t.after(() => rm(directory, { recursive: true, force: true }))
   const path = join(directory, 'session.v4.jsonl.zstd')
   await writeFile(path, 'main transcript fixture')
-  const archiveFile = id => join(directory, 'plugins', '@kabxx', 'dsh-btw', `v${process.env.npm_package_version ?? '0.1.0'}`, 'threads', `${id}.json`)
+  const { version: packageVersion } = createRequire(import.meta.url)('../package.json')
+  const archiveFile = id => join(directory, 'plugins', '@kabxx', 'dsh-btw', `v${process.env.npm_package_version ?? packageVersion}`, 'threads', `${id}.json`)
   return {
     directory, location: { kind: 'jsonl', path }, archiveFile,
     async read(id) {
@@ -407,7 +408,7 @@ test('installed DSH strict Gateway lookup, owner authorization and business APIs
     assert.deepEqual(statCalls, ['session-A'], 'listing tolerates a missing session directory')
     const createFirst = () => invoke('create', { agentId: 'session-A', question: ' side first ' })
     const expectedRejection = error => error.code === 'btw/session-not-saved'
-      && error.message === '请先发送一条消息开始侧问'
+      && error.message === '请先发送一条消息后再发起侧问。'
     await assert.rejects(createFirst(), expectedRejection)
     persisted = { header: {}, revision: 'pending' }
     await assert.rejects(createFirst(), expectedRejection)

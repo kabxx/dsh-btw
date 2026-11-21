@@ -1,8 +1,9 @@
 {
   "name": "@kabxx/dsh-btw",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Inline /btw side questions and sidebar follow-ups for DeepSeek Harness.",
+  "publishConfig": { "access": "public" },
   "repository": { "type": "git", "url": "https://github.com/kabxx/dsh-btw.git" },
   "bugs": { "url": "https://github.com/kabxx/dsh-btw/issues" },
   "engines": { "node": ">=24.9.0", "dsh": "0.2.2-rc.5" },
