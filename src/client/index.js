@@ -518,8 +518,11 @@ function mountFeatures(ctx, React) {
   const t = ctx.locale.bind(namespace)
   const controller = makeController(ctx)
   ctx.effect(() => controller.dispose)
-  const { Dock, Pane, CommandIcon } = createViews(React)
+  const { Dock, Pane, TabTitle, CommandIcon } = createViews(React)
   ctx.effect(() => ctx.sidebarRightTabs.register({ id: plugin, kind: tabKind, title: () => t('title') }))
+  ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab.title', () => ctx.slots.register({
+    name: 'sidebar.right.pane.tab.title', key: plugin,
+  }, TabTitle)))
   ctx.effect(() => ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
     name: 'conversation.input.dock', id: 'kabxx-btw-dock', order: 30, locale: namespace,
   }, props => {

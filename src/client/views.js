@@ -805,12 +805,17 @@ export function createViews(React) {
     return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   }
 
-  function SideQuestionIcon({ className, size = 14 }) {
+  function SideQuestionIcon({ className, size = 14, style }) {
     return h('svg', {
-      className, width: size, height: size, viewBox: '0 0 24 24',
+      className, style, width: size, height: size, viewBox: '0 0 24 24',
       fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round',
       'aria-hidden': true, focusable: false,
     }, sideQuestionPaths.map(path => h('path', { key: path, d: path })));
+  }
+
+  function TabTitle({ useTabInfo }) {
+    const { tab } = useTabInfo();
+    return h(Fragment, null, h(SideQuestionIcon, { size: 16, style: { flex: 'none' } }), tab.title);
   }
 
   function WaitingSpinner() {
@@ -1064,7 +1069,6 @@ export function createViews(React) {
     const reload = () => { setLoad({}); setRetry(value => value + 1); };
     return h(Fragment, null,
       h('header', { className: 'dsh-btw-bar' },
-        h(SideQuestionIcon, { className: 'dsh-btw-mark' }),
         h('h2', { id: scopeId, ref: heading, tabIndex: -1, className: 'dsh-btw-bar-title' }, t('listTitle'))),
       h('section', { className: 'dsh-btw-list', ref: scroller, 'aria-labelledby': scopeId },
         load.failed ? h(Feedback, { text: t('loadFailed'), t, onRetry: reload, error: true }) :
@@ -1565,5 +1569,5 @@ export function createViews(React) {
     });
   }
 
-  return { Dock, Pane, CommandIcon: SideQuestionIcon };
+  return { Dock, Pane, TabTitle, CommandIcon: SideQuestionIcon };
 }
