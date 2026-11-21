@@ -260,6 +260,7 @@ function parseThreadEvent(value) {
 
 export const contextDescriptor = descriptor('contextCapacity', [id], codec(`${PACKAGE_NAME}#ContextWindow`, parseContext))
 export const threadDescriptor = descriptor('watchThread', [id], codec(`${PACKAGE_NAME}#ThreadEvent`, parseThreadEvent), true)
+export const submitCreateDescriptor = descriptor('submitCreate', [question, parameter('submissionId', parseSubmissionId)], detail)
 export const submitFollowupDescriptor = descriptor('submitFollowup', [id, question, parameter('submissionId', parseSubmissionId)], receipt)
-export const TYPERT_REMOTE = Object.freeze({ package: PACKAGE_NAME, descriptors: Object.freeze([...descriptors, contextDescriptor, threadDescriptor, submitFollowupDescriptor]) })
+export const TYPERT_REMOTE = Object.freeze({ package: PACKAGE_NAME, descriptors: Object.freeze([...descriptors, contextDescriptor, threadDescriptor, submitFollowupDescriptor, submitCreateDescriptor]) })
 export const createBtwContribution = () => TYPERT_REMOTE

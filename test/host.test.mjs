@@ -300,7 +300,7 @@ test('installed DSH strict Gateway lookup, owner authorization and business APIs
   const guest = { ...peer, id: 'guest-fixture', principal: { kind: 'guest' } }
   const invoke = (method, args, caller = peer, signal) => ctx.typertGateway.invoke({ namespace: 'btw', method, args, peer: caller, signal })
   try {
-    assert.deepEqual([...TYPERT.invocations, ctx.typert.local.get('btw/contextCapacity'), ctx.typert.local.get('btw/watchThread'), ctx.typert.local.get('btw/submitFollowup')], TYPERT_REMOTE.descriptors)
+    assert.deepEqual([...TYPERT.invocations, ctx.typert.local.get('btw/contextCapacity'), ctx.typert.local.get('btw/watchThread'), ctx.typert.local.get('btw/submitFollowup'), ctx.typert.local.get('btw/submitCreate')], TYPERT_REMOTE.descriptors)
     await assert.rejects(invoke('list', { agentId: 'session-A' }, guest), error => error.code === 'remote-access/denied')
     assert.equal(lookups, 0, 'non-owner was refused before the session lookup')
     await assert.rejects(invoke('list', { agentId: 'session-missing' }))
@@ -332,7 +332,16 @@ test('installed DSH strict Gateway lookup, owner authorization and business APIs
     ]))
     agentA.session.messages.push({ ...msg('m3', 'tool', 'PRIVATE TOOL RESULT'), toolCallId: 'previous-call' })
     agentA.session.surface.nodes.push(7)
-    const first = await invoke('create', { agentId: 'session-A', question: ' side first ' })
+    const firstQuestion = { agentId: 'session-A', question: ' side first ', submissionId: 'b'.repeat(32) }
+    const [first, retriedFirst] = await Promise.all([
+      invoke('submitCreate', firstQuestion), invoke('submitCreate', firstQuestion),
+    ])
+    assert.deepEqual(first, retriedFirst)
+    assert.equal(llm.calls.length, 1)
+    assert.equal((await folder.read(first.id)).turns[0].submissionId, firstQuestion.submissionId)
+    assert.equal(Object.hasOwn(first.turns[0], 'submissionId'), false)
+    await assert.rejects(invoke('submitCreate', { ...firstQuestion, question: 'different question' }),
+      error => error.code === 'btw/submission-mismatch')
     assert.deepEqual(parseDetail(first), first)
     assert.equal(first.question, ' side first ')
     assert.equal(latest(first).status, 'generating')
@@ -482,6 +491,7 @@ test('installed DSH strict Gateway lookup, owner authorization and business APIs
     })
     try {
       await reopened.prepare('session-A')
+      assert.deepEqual(await reopened.create(agentA, firstQuestion.question, undefined, firstQuestion.submissionId), detail)
       assert.deepEqual(await reopened.followup('session-A', first.id, submission.question, undefined, submission.submissionId), storedReceipt)
       assert.equal(llm.calls.length, 2, 'resubmitting after restart does not start another request')
     } finally {
@@ -518,6 +528,24 @@ test('installed DSH strict Gateway lookup, owner authorization and business APIs
   } finally {
     peerController.abort()
     await fiber.dispose()
+  }
+})
+
+test('identical first questions are archived independently for distinct submissions', async () => {
+  const store = memoryStore()
+  const llm = controlledModel()
+  const host = new BtwHost({ store, llm })
+  const agent = makeAgent('session-A')
+  try {
+    const submissions = ['a', 'b', 'c'].map(value => value.repeat(32))
+    const records = await Promise.all(submissions.map(id => host.create(agent, 'same question', undefined, id)))
+    assert.equal(new Set(records.map(record => record.id)).size, 3)
+    assert.equal(store.saved.size, 3)
+    assert.equal(llm.calls.length, 3)
+    assert.deepEqual(await host.create(agent, 'same question', undefined, submissions[0]), records[0])
+    assert.equal(llm.calls.length, 3)
+  } finally {
+    await host.close()
   }
 })
 

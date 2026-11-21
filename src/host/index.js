@@ -5,7 +5,7 @@ import { resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 import {
-  CONTEXT_OVERFLOW, NATIVE_FAILURE_DETAILS, PACKAGE_NAME, TOKEN_FIELDS, contextDescriptor, parseDetail, parseQuestion, parseSessionId, parseSubmissionId, parseThreadId, parseVersion, submitFollowupDescriptor, threadDescriptor,
+  CONTEXT_OVERFLOW, NATIVE_FAILURE_DETAILS, PACKAGE_NAME, TOKEN_FIELDS, contextDescriptor, parseDetail, parseQuestion, parseSessionId, parseSubmissionId, parseThreadId, parseVersion, submitCreateDescriptor, submitFollowupDescriptor, threadDescriptor,
 } from '../shared/wire.js'
 import { sessionThreadStore } from './session-store.js'
 
@@ -400,7 +400,7 @@ export class BtwHost {
       state = undefined
     }
     if (!state) {
-      state = { owner, controller: new AbortController(), records: new Map(), terminalWrites: new Map() }
+      state = { owner, controller: new AbortController(), records: new Map(), terminalWrites: new Map(), creating: new Map() }
       // AgentLoop disposes the agent scope before closing the session write handle.
       state.disposeOwner = owner?.ctx?.effect(() => () => {
         state.disposeOwner = undefined
@@ -558,11 +558,21 @@ export class BtwHost {
     return { contextWindow: capacity, estimatedTokens: fullEstimate + Math.max(0, nativeAdjustment, usageAdjustment) }
   }
 
-  async create(agent, question, signal) {
+  async create(agent, question, signal, submissionId) {
     parseQuestion(question)
+    if (submissionId !== undefined) parseSubmissionId(submissionId)
     const sessionId = parseSessionId(agent.session.id)
     if (!await this.prepare(sessionId, signal, agent)) {
       throw fault('session-not-saved', '请先发送一条消息开始侧问')
+    }
+    const state = this.sessions.get(sessionId)
+    if (submissionId !== undefined) {
+      const accepted = [...state.records.values()].find(record => record.turns[0].submissionId === submissionId)
+      const pending = state.creating.get(submissionId)
+      if (accepted || pending) {
+        if ((accepted ?? pending).question !== question) throw fault('submission-mismatch', '侧问提交内容不一致。')
+        return accepted ? toDetail(accepted) : pending.admission
+      }
     }
     const selected = agent.model.current()
     const model = routeSchema.safeParse(selected && {
@@ -573,10 +583,18 @@ export class BtwHost {
     if (!model.success) throw fault('model-unavailable', '当前会话未配置可用模型。')
     const time = Date.now()
     const { route, snapshot } = freezeSnapshot(agent.session, model.data, this.mainRequests.get(agent.session), this.tokenMeter)
-    return this.admit({
+    const turn = nextTurn(question, time)
+    if (submissionId !== undefined) turn.submissionId = submissionId
+    const admission = this.admit({
       id: `btw-${randomUUID()}`, sessionId, question, createdAt: time, updatedAt: time, version: 1,
-      turns: [nextTurn(question, time)], route, snapshot,
+      turns: [turn], route, snapshot,
     })
+    if (submissionId !== undefined) {
+      state.creating.set(submissionId, { question, admission })
+      const clear = () => state.creating.delete(submissionId)
+      admission.then(clear, clear)
+    }
+    return admission
   }
 
   followup(sessionId, id, question, signal, submissionId) {
@@ -881,7 +899,7 @@ export default class BtwService extends TypertRemoteService {
     // contribution with the live plugin so an installed update exposes it immediately.
     this.ctx.typert.register({
       package: `${PACKAGE_NAME}-meter`, face: 'host', schemas: [],
-      model: { services: [], events: [], objects: [] }, invocations: [contextDescriptor, threadDescriptor, submitFollowupDescriptor],
+      model: { services: [], events: [], objects: [] }, invocations: [contextDescriptor, threadDescriptor, submitFollowupDescriptor, submitCreateDescriptor],
     })
   }
 
@@ -904,6 +922,12 @@ export default class BtwService extends TypertRemoteService {
     const { available } = await this.prepare(agent, signal)
     if (!available) throw fault('session-not-saved', '请先发送一条消息开始侧问')
     return this.host.create(agent, question, signal)
+  }
+
+  async submitCreate(agent, question, submissionId, signal) {
+    const { available } = await this.prepare(agent, signal)
+    if (!available) throw fault('session-not-saved', '请先发送一条消息开始侧问')
+    return this.host.create(agent, question, signal, submissionId)
   }
 
   async list(agent, signal) {

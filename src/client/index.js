@@ -39,6 +39,11 @@ function base64(bytes) {
   return btoa(binary)
 }
 
+function newSubmissionId() {
+  return Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)),
+    byte => byte.toString(16).padStart(2, '0')).join('')
+}
+
 export function makeController(ctx) {
   const sidebar = ctx.sidebarRight
   const listeners = new Set()
@@ -228,8 +233,7 @@ export function makeController(ctx) {
     async submitDraft(sessionId, id) {
       const draft = getDraft(sessionId, id)
       if (disposed || draft.saving || !draft.text.trim()) return
-      const submissionId = draft.submissionId ?? Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)),
-        byte => byte.toString(16).padStart(2, '0')).join('')
+      const submissionId = draft.submissionId ?? newSubmissionId()
       publishDraft(sessionId, id, { ...draft, submissionId, saving: true, error: undefined })
       try {
         const receipt = unwrap(await ctx.remote.btw.submitFollowup(sessionId, id, draft.text, submissionId))
@@ -257,8 +261,9 @@ export function makeController(ctx) {
     restoreCard,
     dismiss: dismissCard,
     async createCard(id, question) {
+      const submissionId = newSubmissionId()
       const request = ++lastCardRequest
-      const detail = unwrap(await ctx.remote.btw.create(id, question))
+      const detail = unwrap(await ctx.remote.btw.submitCreate(id, question, submissionId))
       if (disposed) return
       const listRevision = snapshot.listRevision + 1
       if (request <= (lastAcceptedCards.get(id) ?? 0)) {

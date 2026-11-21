@@ -283,10 +283,57 @@ test('a competing follow-up retains the draft and reports that the reply is gene
   }
 })
 
+test('each active first-question submission has its own ID even with identical text', async () => {
+  const ctx = harness()
+  const controller = makeController(ctx)
+  const attempts = []
+  ctx.remote.btw.submitCreate = (sessionId, question, id) => {
+    assert.equal(sessionId, 'main')
+    assert.equal(question, 'same question')
+    const receipt = Promise.withResolvers()
+    attempts.push({ id, receipt })
+    return receipt.promise
+  }
+  const source = makeSource(controller, key => zh.ui[key])
+  const { claim } = await source.matchEnter({ sessionId: 'main' }, '/侧问 same question',
+    new AbortController().signal, { attachments: 0 })
+  try {
+    const submissions = [claim.submit('same question'), claim.submit('same question'), claim.submit('same question')]
+    assert.equal(new Set(attempts.map(attempt => attempt.id)).size, 3)
+    for (const attempt of attempts) assert.match(attempt.id, /^[a-f0-9]{32}$/u)
+    for (const { id, receipt } of attempts.toReversed()) receipt.resolve({ ok: true, value: { id } })
+    assert.deepEqual(await Promise.all(submissions), Array(3).fill({ kind: 'success' }))
+    assert.equal(controller.getSnapshot().cards.main.id, attempts[2].id)
+    assert.equal(controller.getSnapshot().listRevision, 3)
+  } finally {
+    controller.dispose()
+  }
+})
+
+test('resending a rejected first question advances card ordering with a new ID', async () => {
+  const ctx = harness()
+  const controller = makeController(ctx)
+  const attempts = []
+  ctx.remote.btw.submitCreate = async (_sessionId, question, id) => {
+    attempts.push(id)
+    if (attempts.length === 1) return { ok: false, error: { code: 'btw/save-failed', message: 'Host rejection' } }
+    return { ok: true, value: { id: question } }
+  }
+  try {
+    await assert.rejects(controller.createCard('main', 'first'), { code: 'btw/save-failed' })
+    await controller.createCard('main', 'second')
+    await controller.createCard('main', 'first')
+    assert.equal(new Set(attempts).size, 3)
+    assert.equal(controller.getSnapshot().cards.main.id, 'first')
+  } finally {
+    controller.dispose()
+  }
+})
+
 test('exact command interception, text-only envelope and independent submit', async () => {
   const ctx = harness()
   const call = []
-  ctx.remote.btw.create = async (id, question) => {
+  ctx.remote.btw.submitCreate = async (id, question) => {
     call.push([id, question])
     return { ok: true, value: { id: 'created' } }
   }
@@ -340,7 +387,7 @@ test('an unsaved session uses the localized native command error while leaving l
     for (const locale of [zh.ui, en.ui]) {
       const source = makeSource(controller, key => locale[key])
       const match = line => source.matchEnter(session, line, signal, { attachments: 0 })
-      ctx.remote.btw.create = async (id, question) => {
+      ctx.remote.btw.submitCreate = async (id, question) => {
         assert.equal(id, session.sessionId)
         assert.equal(question, draft)
         return rejected
@@ -355,10 +402,10 @@ test('an unsaved session uses the localized native command error while leaving l
         ['btw/model-unavailable', locale.modelUnavailable],
         ['btw/save-failed', locale.saveFailed],
       ]) {
-        ctx.remote.btw.create = async () => ({ ok: false, error: { code, message: 'Host fallback' } })
+        ctx.remote.btw.submitCreate = async () => ({ ok: false, error: { code, message: 'Host fallback' } })
         assert.deepEqual(await claim.submit(draft), { kind: 'error', text })
       }
-      ctx.remote.btw.create = async () => ({ ok: false, error: { code: 'btw/unexpected', message: 'Host fallback' } })
+      ctx.remote.btw.submitCreate = async () => ({ ok: false, error: { code: 'btw/unexpected', message: 'Host fallback' } })
       await assert.rejects(claim.submit(draft), { code: 'btw/unexpected', message: 'Host fallback' })
     }
   } finally {
@@ -368,7 +415,7 @@ test('an unsaved session uses the localized native command error while leaving l
 
 test('explicitly reopening history resets its position but adding a card only refreshes the contents', async () => {
   const ctx = harness()
-  ctx.remote.btw.create = async () => ({ ok: true, value: { id: 'new' } })
+  ctx.remote.btw.submitCreate = async () => ({ ok: true, value: { id: 'new' } })
   const controller = makeController(ctx)
   try {
     assert.equal(controller.openList('main'), true)
@@ -388,16 +435,16 @@ test('a card stays until dismissed or replaced by a newer accepted side question
   const controller = makeController(ctx)
   const accepted = id => ({ ok: true, value: { id } })
   try {
-    ctx.remote.btw.create = async () => accepted('first')
+    ctx.remote.btw.submitCreate = async () => accepted('first')
     await controller.createCard('main', 'first')
     controller.openList('main')
     controller.openDetail('main', 'first')
     assert.equal(controller.getSnapshot().cards.main.id, 'first')
 
     const next = Promise.withResolvers()
-    ctx.remote.btw.create = () => next.promise
+    ctx.remote.btw.submitCreate = () => next.promise
     const pending = controller.createCard('main', 'next')
-    ctx.remote.btw.create = async () => ({ ok: false, error: { message: 'rejected' } })
+    ctx.remote.btw.submitCreate = async () => ({ ok: false, error: { message: 'rejected' } })
     await assert.rejects(controller.createCard('main', 'rejected'), /rejected/)
     assert.equal(controller.getSnapshot().cards.main.id, 'first')
     next.resolve(accepted('next'))
@@ -405,9 +452,9 @@ test('a card stays until dismissed or replaced by a newer accepted side question
     assert.equal(controller.getSnapshot().cards.main.id, 'next')
 
     const older = Promise.withResolvers()
-    ctx.remote.btw.create = () => older.promise
+    ctx.remote.btw.submitCreate = () => older.promise
     const late = controller.createCard('main', 'older')
-    ctx.remote.btw.create = async () => accepted('newest')
+    ctx.remote.btw.submitCreate = async () => accepted('newest')
     await controller.createCard('main', 'newest')
     assert.equal(controller.getSnapshot().cards.main.id, 'newest')
     controller.dismiss('main', 'newest')
@@ -426,7 +473,7 @@ test('moving a card to the sidebar only dismisses it once the side question is v
   const create = id => ({ ok: true, value: { id, sessionId: 'main', turns: [{ status: 'generating' }] } })
   try {
     await flush()
-    ctx.remote.btw.create = async () => create('first')
+    ctx.remote.btw.submitCreate = async () => create('first')
     await controller.createCard('main', 'first')
     assert.equal(controller.openList('main'), true)
     sidebarRight.toggleExpanded()
@@ -466,7 +513,7 @@ test('a card restores on return and page reopen until dismissed or moved to the 
     controllers.push(controller)
     return controller
   }
-  ctx.remote.btw.create = async () => ({ ok: true, value: { ...crashed, turns: [] } })
+  ctx.remote.btw.submitCreate = async () => ({ ok: true, value: { ...crashed, turns: [] } })
   ctx.remote.btw.get = async (sessionId, id) => {
     assert.equal(sessionId, 'main')
     assert.equal(id, 'finished')
@@ -521,8 +568,8 @@ test('dismissing an older card in another tab preserves the newer card on reload
   const controllers = []
   const start = () => {
     const ctx = harness()
-    ctx.remote.btw.create = async (sessionId, id) => ({ ok: true, value: { sessionId, id } })
-    ctx.remote.btw.get = ctx.remote.btw.create
+    ctx.remote.btw.submitCreate = async (sessionId, id) => ({ ok: true, value: { sessionId, id } })
+    ctx.remote.btw.get = ctx.remote.btw.submitCreate
     const controller = makeController(ctx)
     controllers.push(controller)
     return controller
@@ -556,7 +603,7 @@ test('dismissing an older card in another tab preserves the newer card on reload
 test('a late create receipt is remembered only for its own session', async () => {
   const ctx = harness()
   const receipt = Promise.withResolvers()
-  ctx.remote.btw.create = () => receipt.promise
+  ctx.remote.btw.submitCreate = () => receipt.promise
   const detail = { id: 'accepted', sessionId: 'main' }
   ctx.remote.btw.get = async () => ({ ok: true, value: detail })
   const controller = makeController(ctx)
@@ -817,7 +864,13 @@ test('installed Cordis and Gateway let the real plugin caller resolve remote.btw
     assert.ok(source)
     const { claim } = await source.matchEnter({ sessionId: 'main' }, '/btw test', new AbortController().signal, { attachments: 0 })
     assert.equal((await claim.submit('test')).kind, 'success')
-    assert.deepEqual(calls, [{ path: '/api', endpoint: 'btw/create', args: { agentId: 'main', question: 'test' } }])
+    assert.equal(calls.length, 1)
+    const [{ path, endpoint, args }] = calls
+    assert.equal(path, '/api')
+    assert.equal(endpoint, 'btw/submitCreate')
+    assert.equal(args.agentId, 'main')
+    assert.equal(args.question, 'test')
+    assert.match(args.submissionId, /^[a-f0-9]{32}$/u)
   } finally {
     await pluginFiber.dispose()
     await gatewayFiber.dispose()
