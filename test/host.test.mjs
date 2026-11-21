@@ -1009,6 +1009,40 @@ test('side requests preserve explicit limits and resolve adapter defaults for th
   }
 })
 
+test('new side questions defer to the model default after changing reasoning effort', { timeout: 5_000 }, async () => {
+  const llm = controlledModel()
+  const archive = memoryStore()
+  const host = new BtwHost({ store: archive, llm })
+  try {
+    const agent = makeAgent('session-default-reasoning')
+    agent.session.messages = [msg('main', 'user', 'Main question')]
+    const previous = { ...agent.selected, maxTokens: 16 }
+    agent.session.requestHeader = () => ({ config: previous })
+    host.observeMain(agent.session, { ...previous, messages: [...agent.session.messages], system: 'Observed request' })
+
+    const cases = [
+      { label: 'explicit effort', effort: 'high', system: 'Observed request' },
+      { label: 'default on matching observed request', system: 'Observed request' },
+      { label: 'default with only a matching header', changeSurface: true },
+    ]
+    for (const [index, { label, effort, system, changeSurface }] of cases.entries()) {
+      if (effort === undefined) delete agent.selected.reasoningEffort
+      if (changeSurface) agent.session.messages.push(msg('later', 'assistant', 'Main answer'))
+      const { id, sessionId } = await host.create(agent, label)
+      const call = await llm.waitForCount(index + 1)
+      assert.equal(call.options.reasoningEffort, effort, label)
+      assert.equal(archive.saved.get(id).route.reasoningEffort, effort, label)
+      assert.equal(call.options.system, system, label)
+      assert.equal(call.options.maxTokens, 16, label)
+      call.emit(text('done'))
+      call.emit(finish())
+      await terminal(host.watch(sessionId, id, undefined, () => {}))
+    }
+  } finally {
+    await host.close()
+  }
+})
+
 test('native Responses reuses the main cache key only at transport, including after restart', { timeout: 10_000 }, async t => {
   const app = new Context()
   const agent = makeAgent('session-openai-cache-fixture')

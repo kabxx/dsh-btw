@@ -206,7 +206,9 @@ function freezeSnapshot(session, selected, observed, tokenMeter) {
   const controls = exact?.request ?? matchingHeader?.config ?? selected
   const usesAdapterDefault = exact ? exact.usesAdapterDefault : matchingHeader?.adapterDefaults?.maxTokens
   const maxTokens = usesAdapterDefault ? undefined : controls.maxTokens
-  const route = { ...selected, reasoningEffort: selected.reasoningEffort ?? controls.reasoningEffort }
+  // The current selection owns reasoning effort. An omitted value means the
+  // model default, even when an observed request used an explicit effort.
+  const route = selected
   const messages = exact?.request.messages ?? derived.slice(0, end)
   const tools = exact ? exact.request.tools : header?.tools
   let toolHistory = exact ? exact.request.toolHistory : session.toolHistory?.()
