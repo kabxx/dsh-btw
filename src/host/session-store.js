@@ -46,7 +46,30 @@ function snapshotFileFor(file) {
   return join(dirname(dirname(file)), 'snapshots', basename(file))
 }
 
-export function sessionThreadStore(persistence, parseRecord, onMalformedRecord, onSnapshotCleanupError) {
+async function readSnapshot(file, signal, schema, onMalformedRecord) {
+  const contents = await readFile(snapshotFileFor(file), { encoding: 'utf8', signal }).catch(error => {
+    if (error.code !== 'ENOENT') throw error
+  })
+  if (contents === undefined) {
+    onMalformedRecord?.(file, 'missing thread snapshot')
+    return
+  }
+  let snapshot
+  try {
+    snapshot = JSON.parse(contents)
+  } catch {
+    onMalformedRecord?.(file, 'invalid thread snapshot JSON')
+    return
+  }
+  const parsed = schema.safeParse(snapshot)
+  if (!parsed.success) {
+    onMalformedRecord?.(file, 'invalid thread snapshot')
+    return
+  }
+  return parsed.data
+}
+
+export function sessionThreadStore(persistence, schemas, onMalformedRecord, onSnapshotCleanupError) {
   return {
     async open(sessionId, signal) {
       const snapshot = await persistence.stat(sessionId, { signal })
@@ -91,26 +114,9 @@ export function sessionThreadStore(persistence, parseRecord, onMalformedRecord, 
           const { schemaVersion } = envelope
           if (schemaVersion !== INLINE_SCHEMA_VERSION && schemaVersion !== SCHEMA_VERSION) continue
           const hasSnapshot = schemaVersion === SCHEMA_VERSION
-          let storedRecord = envelope.record
-          if (hasSnapshot) {
-            const snapshotFile = snapshotFileFor(file)
-            const snapshotContents = await readFile(snapshotFile, { encoding: 'utf8', signal }).catch(error => {
-              if (error.code !== 'ENOENT') throw error
-            })
-            if (snapshotContents === undefined) {
-              onMalformedRecord?.(file, 'missing thread snapshot')
-              continue
-            }
-            try {
-              storedRecord = { ...storedRecord, snapshot: JSON.parse(snapshotContents) }
-            } catch {
-              onMalformedRecord?.(file, 'invalid thread snapshot JSON')
-              continue
-            }
-          }
           let record
           try {
-            record = parseRecord(storedRecord)
+            record = (hasSnapshot ? schemas.record : schemas.inline).parse(envelope.record)
           } catch {
             onMalformedRecord?.(file, 'invalid thread record')
             continue
@@ -127,6 +133,21 @@ export function sessionThreadStore(persistence, parseRecord, onMalformedRecord, 
       signal.throwIfAborted()
       return {
         records,
+        async loadSnapshot(id) {
+          signal.throwIfAborted()
+          const entry = files.get(parseThreadId(id))
+          if (!entry?.hasSnapshot) return
+          const loading = entry.loading ??= readSnapshot(entry.file, signal, schemas.snapshot, onMalformedRecord)
+          let snapshot
+          try {
+            snapshot = await loading
+            signal.throwIfAborted()
+            return snapshot
+          } finally {
+            // Keep successful reads for this owner, and allow repaired files to be read again.
+            if (snapshot === undefined && entry.loading === loading) delete entry.loading
+          }
+        },
         async put({ snapshot, ...record }, ownerSignal = signal) {
           ownerSignal.throwIfAborted()
           const id = parseThreadId(record.id)
@@ -135,7 +156,7 @@ export function sessionThreadStore(persistence, parseRecord, onMalformedRecord, 
           const snapshotFile = snapshotFileFor(file)
           if (!existing?.hasSnapshot) {
             // Publish the frozen prefix first so either archive format stays readable.
-            await replaceArchiveFile(sessionDirectory, snapshotFile, snapshot, ownerSignal)
+            await replaceArchiveFile(sessionDirectory, snapshotFile, schemas.snapshot.parse(snapshot), ownerSignal)
           }
           try {
             await replaceArchiveFile(sessionDirectory, file, { schemaVersion: SCHEMA_VERSION, record }, ownerSignal)

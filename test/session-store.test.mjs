@@ -5,7 +5,7 @@ import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { threadSchema } from '../src/host/index.js'
+import { archiveSchemas } from '../src/host/index.js'
 import { sessionThreadStore } from '../src/host/session-store.js'
 import { PACKAGE_NAME } from '../src/shared/wire.js'
 
@@ -29,7 +29,7 @@ function makeStore(path, onMalformedRecord) {
       return { location: { kind: 'jsonl', path } }
     },
   }
-  return sessionThreadStore(persistence, record => threadSchema.parse(record), onMalformedRecord)
+  return sessionThreadStore(persistence, archiveSchemas, onMalformedRecord)
 }
 
 test('a corrupt thread does not prevent reading and creating healthy side questions', async () => {
@@ -57,7 +57,9 @@ test('a corrupt thread does not prevent reading and creating healthy side questi
   const added = makeRecord(newId)
   await opened.put(added)
   const reopened = await store.open(sessionId, signal)
-  assert.deepEqual(new Map(reopened.records.map(record => [record.id, record])), new Map([[healthy.id, healthy], [added.id, added]]))
+  const { snapshot, ...thread } = added
+  assert.deepEqual(new Map(reopened.records.map(record => [record.id, record])), new Map([[healthy.id, healthy], [added.id, thread]]))
+  assert.deepEqual(await reopened.loadSnapshot(added.id), snapshot)
   for (const [name, contents] of malformed) assert.equal(await readFile(join(directory, name), 'utf8'), contents)
   assert.equal(await readFile(healthyFile, 'utf8'), healthyContents)
   assert.equal(await readFile(path, 'utf8'), 'main transcript fixture\n')
@@ -94,7 +96,9 @@ test('an unreadable thread does not prevent reading and creating healthy side qu
     const added = makeRecord(newId)
     await opened.put(added)
     const reopened = await store.open(sessionId, signal)
-    assert.deepEqual(new Map(reopened.records.map(record => [record.id, record])), new Map([[healthy.id, healthy], [added.id, added]]))
+    const { snapshot, ...thread } = added
+    assert.deepEqual(new Map(reopened.records.map(record => [record.id, record])), new Map([[healthy.id, healthy], [added.id, thread]]))
+    assert.deepEqual(await reopened.loadSnapshot(added.id), snapshot)
 
     deniedFiles.set(deniedFiles.keys().next().value, 'EIO')
     await assert.rejects(store.open(sessionId, signal), { code: 'EIO' })
@@ -143,18 +147,22 @@ test('progress writes keep a large frozen snapshot in one immutable file', async
   }
   await opened.put(updated)
   const reopened = await store.open(sessionId, signal)
-  assert.deepEqual(reopened.records, [updated])
+  const { snapshot, ...thread } = updated
+  assert.deepEqual(reopened.records, [thread])
+  assert.deepEqual(await reopened.loadSnapshot(healthyId), snapshot)
   const final = {
     ...updated, version: 3,
     turns: [{ ...updated.turns[0], reply: 'complete answer' }],
   }
   await reopened.put(final)
-  assert.deepEqual((await store.open(sessionId, signal)).records, [final])
+  const loaded = await store.open(sessionId, signal)
+  const { snapshot: finalSnapshot, ...diskRecord } = final
+  assert.deepEqual(loaded.records, [diskRecord])
+  assert.deepEqual(await loaded.loadSnapshot(healthyId), finalSnapshot)
   assert.deepEqual(await readdir(join(directory, 'snapshots')), [`${healthyId}.json`])
   assert.deepEqual(JSON.parse(await readFile(snapshotFile, 'utf8')), record.snapshot)
   assert.equal((await stat(snapshotFile)).mtimeMs, originalSnapshotStats.mtimeMs)
   assert.ok((await stat(threadFile)).size < 1024)
-  const { snapshot, ...diskRecord } = final
   assert.deepEqual(JSON.parse(await readFile(threadFile, 'utf8')), { schemaVersion: 2, record: diskRecord })
   assert.equal(await readFile(path, 'utf8'), 'main transcript fixture\n')
 })
@@ -187,7 +195,10 @@ test('interrupted inline migration keeps the legacy record readable', async () =
   const reopened = await store.open(sessionId, signal)
   assert.deepEqual(reopened.records, [legacy])
   await reopened.put(edited)
-  assert.deepEqual((await store.open(sessionId, signal)).records, [edited])
+  const { snapshot, ...thread } = edited
+  const loaded = await store.open(sessionId, signal)
+  assert.deepEqual(loaded.records, [thread])
+  assert.deepEqual(await loaded.loadSnapshot(healthyId), snapshot)
   assert.equal(JSON.parse(await readFile(file, 'utf8')).schemaVersion, 2)
 })
 
@@ -215,6 +226,16 @@ test('dangling and malformed snapshot files are isolated to their thread', async
   const missingId = 'btw-12345678-1234-1234-1234-123456789014'
   const otherFile = join(directory, 'threads', `${missingId}.json`)
   await writeFile(otherFile, JSON.stringify({ schemaVersion: 2, record: { ...unlinked, id: missingId } }))
-  assert.deepEqual((await store.open(sessionId, signal)).records, [healthy])
+  const opened = await store.open(sessionId, signal)
+  assert.deepEqual(new Map(opened.records.map(record => [record.id, record])), new Map([
+    [healthyId, healthy], [newId, unlinked], [missingId, { ...unlinked, id: missingId }],
+  ]))
+  assert.deepEqual(warnings, [])
+  assert.equal(await opened.loadSnapshot(newId), undefined)
+  assert.equal(await opened.loadSnapshot(missingId), undefined)
   assert.deepEqual(new Map(warnings), new Map([[file, 'invalid thread snapshot JSON'], [otherFile, 'missing thread snapshot']]))
+
+  await writeFile(join(directory, 'snapshots', `${newId}.json`), JSON.stringify(snapshot))
+  assert.deepEqual(await opened.loadSnapshot(newId), snapshot)
+  assert.equal(await opened.loadSnapshot(missingId), undefined)
 })

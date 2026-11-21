@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, mkdtempDisposable, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
-import { createRequire } from 'node:module'
+import fs, { mkdir, mkdtemp, mkdtempDisposable, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import BtwService, { BtwHost, threadSchema } from '../src/host/index.js'
+import BtwService, { BtwHost, archiveSchemas, threadSchema } from '../src/host/index.js'
 import { sessionThreadStore } from '../src/host/session-store.js'
 import { TYPERT } from '../src/host/typert.js'
 import { CONTEXT_OVERFLOW, TYPERT_REMOTE, applyThreadEvent, parseDetail, threadDescriptor } from '../src/shared/wire.js'
@@ -137,7 +137,7 @@ test('session storage keeps different sessions and creation versions separate', 
   const first = await sessionFolder(t)
   const second = await sessionFolder(t)
   const persistence = { stat: async id => ({ location: id === 'session-A' ? first.location : second.location }) }
-  const store = sessionThreadStore(persistence, record => threadSchema.parse(record))
+  const store = sessionThreadStore(persistence, archiveSchemas)
   const signal = new AbortController().signal
   const id = 'btw-12345678-1234-1234-1234-123456789012'
   const now = Date.now()
@@ -159,9 +159,69 @@ test('session storage keeps different sessions and creation versions separate', 
   await assert.rejects(readFile(first.archiveFile(id)), { code: 'ENOENT' })
 })
 
+test('listing reopened archives reads no snapshots and context requests load only their own snapshot', { timeout: 5000 }, async t => {
+  const fixture = await sessionFolder(t)
+  const agent = makeAgent('session-lazy-snapshots')
+  const archive = sessionThreadStore({ stat: async () => ({ location: fixture.location }) }, archiveSchemas)
+  const opened = await archive.open(agent.session.id, new AbortController().signal)
+  const ids = Array.from({ length: 20 }, (_, index) => `btw-12345678-1234-1234-1234-${String(index).padStart(12, '0')}`)
+  const snapshotFile = id => join(dirname(dirname(fixture.archiveFile(id))), 'snapshots', `${id}.json`)
+  for (const [index, id] of ids.entries()) {
+    await opened.put({
+      id, sessionId: agent.session.id, question: 'question', createdAt: index, updatedAt: index, version: 1,
+      turns: [{ question: 'question', reply: 'answer', status: 'completed', createdAt: index, finishedAt: index }],
+      route: { provider: 'fixture-provider', model: 'fixture-model' },
+      snapshot: { mode: 'native', anchor: null, messages: [msg(`main-${index}`, 'user', `frozen context ${index}`)] },
+    })
+  }
+  await unlink(snapshotFile(ids[2]))
+  const snapshotReads = []
+  const snapshots = dirname(snapshotFile(ids[0]))
+  const originalReadFile = fs.readFile
+  const readMock = t.mock.method(fs, 'readFile', (file, options) => {
+    if (typeof file === 'string' && dirname(file) === snapshots) snapshotReads.push(file)
+    return originalReadFile(file, options)
+  })
+  syncBuiltinESMExports()
+  const llm = controlledModel()
+  llm.resolveModelInfo = async () => ({ context: { contextWindow: 1000 } })
+  const host = new BtwHost({ store: archive, llm })
+  try {
+    await host.prepare(agent.session.id, undefined, agent)
+    assert.equal(host.list(agent.session.id).length, ids.length)
+    assert.equal(latest(host.get(agent.session.id, ids[2])).reply, 'answer')
+    assert.deepEqual(snapshotReads, [])
+
+    const meters = await Promise.all([
+      host.contextWindow(agent.session.id, ids[0]),
+      host.contextWindow(agent.session.id, ids[0]),
+    ])
+    assert.ok(meters.every(meter => meter.contextWindow === 1000 && meter.estimatedTokens > 0))
+    assert.deepEqual(snapshotReads, [snapshotFile(ids[0])])
+
+    await host.followup(agent.session.id, ids[1], 'continue')
+    const call = await llm.waitForCount(1)
+    assert.match(allText(call.options), /frozen context 1\b/u)
+    assert.deepEqual(snapshotReads, [snapshotFile(ids[0]), snapshotFile(ids[1])])
+    call.emit(text('continued'))
+    call.emit(finish())
+    await terminal(host.watch(agent.session.id, ids[1], null, () => {}))
+
+    assert.deepEqual(await host.contextWindow(agent.session.id, ids[2]), { contextWindow: null })
+    await assert.rejects(host.followup(agent.session.id, ids[2], 'cannot continue'), { code: 'btw/snapshot-unavailable' })
+    assert.equal(llm.calls.length, 1)
+    assert.equal(host.get(agent.session.id, ids[2]).turns.length, 1)
+    assert.equal(await readFile(fixture.location.path, 'utf8'), 'main transcript fixture')
+  } finally {
+    readMock.mock.restore()
+    syncBuiltinESMExports()
+    await host.close()
+  }
+})
+
 test('an old Host stops writing before the successor takes over the session', { timeout: 5000 }, async t => {
   const fixture = await sessionFolder(t)
-  const archive = sessionThreadStore({ stat: async () => ({ location: fixture.location }) }, record => threadSchema.parse(record))
+  const archive = sessionThreadStore({ stat: async () => ({ location: fixture.location }) }, archiveSchemas)
   const oldWriteEntered = Promise.withResolvers()
   const oldWriteFinished = Promise.withResolvers()
   const releaseOldWrite = Promise.withResolvers()
@@ -170,7 +230,7 @@ test('an old Host stops writing before the successor takes over the session', { 
     async open(...args) {
       const opened = await archive.open(...args)
       return {
-        records: opened.records,
+        ...opened,
         async put(record, signal) {
           if (!holdOldCheckpoint || latest(record).reply !== 'uncommitted old fragment') {
             return opened.put(record, signal)
@@ -238,7 +298,7 @@ test('an old Host stops writing before the successor takes over the session', { 
 
 test('a failed first archive write rolls back its snapshot before retrying the same submission', { timeout: 5000 }, async t => {
   const fixture = await sessionFolder(t)
-  const archive = sessionThreadStore({ stat: async () => ({ location: fixture.location }) }, record => threadSchema.parse(record))
+  const archive = sessionThreadStore({ stat: async () => ({ location: fixture.location }) }, archiveSchemas)
   const llm = controlledModel()
   const host = new BtwHost({ store: archive, llm })
   const agent = makeAgent('session-create-retry')
@@ -278,7 +338,7 @@ test('side questions cannot recreate a removed main session directory', async ()
   await mkdir(sessionDir)
   const location = { kind: 'jsonl', path: join(sessionDir, 'session.jsonl') }
   await writeFile(location.path, 'main transcript fixture')
-  const store = sessionThreadStore({ stat: async () => ({ location }) }, record => threadSchema.parse(record))
+  const store = sessionThreadStore({ stat: async () => ({ location }) }, archiveSchemas)
   const llm = controlledModel()
   const host = new BtwHost({ store, llm })
   const agent = makeAgent('session-removed')
@@ -523,7 +583,7 @@ test('installed DSH strict Gateway lookup, owner authorization and business APIs
     assert.equal(storedReceipt.turn.reply, '可以复用')
     assert.equal(llm.calls.length, 2)
     const reopened = new BtwHost({
-      store: sessionThreadStore({ stat: async () => ({ location: folder.location }) }, record => threadSchema.parse(record)),
+      store: sessionThreadStore({ stat: async () => ({ location: folder.location }) }, archiveSchemas),
       llm,
     })
     try {
@@ -1084,7 +1144,7 @@ test('native Cordis/LLM waterfall freezes and reuses the main request across res
     await terminal(host.watch(sessionId, id, undefined, () => {}))
     assert.equal(requests[2].body.max_tokens, 16)
     agent.session.messages = [msg('later', 'user', 'new main surface')]
-    const reopened = new BtwHost({ store: sessionThreadStore(ctx.sessionPersistence, record => threadSchema.parse(record)), llm: ctx.llm })
+    const reopened = new BtwHost({ store: sessionThreadStore(ctx.sessionPersistence, archiveSchemas), llm: ctx.llm })
     try {
       await reopened.prepare(sessionId)
       await reopened.followup(sessionId, id, 'reopened question')
@@ -1229,7 +1289,7 @@ test('native Responses reuses the main cache key only at transport, including af
     assert.equal(calls[1].body.max_output_tokens, calls[0].body.max_output_tokens)
     const saved = await folder.read(id)
     assert.equal(Object.hasOwn(saved.snapshot, 'sessionId'), false)
-    const reopened = new BtwHost({ store: sessionThreadStore(app.sessionPersistence, record => threadSchema.parse(record)), llm: app.llm })
+    const reopened = new BtwHost({ store: sessionThreadStore(app.sessionPersistence, archiveSchemas), llm: app.llm })
     try {
       await reopened.prepare(sessionId)
       await reopened.followup(sessionId, id, 'after restart')

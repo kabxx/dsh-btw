@@ -108,7 +108,7 @@ const turnSchema = z.strictObject({
   usage: z.strictObject(Object.fromEntries(TOKEN_FIELDS.map(key => [key, tokenCount.optional()]))).optional(),
   timing: z.strictObject({ requestMs: timestamp, firstTokenMs: timestamp.optional() }).optional(),
 })
-export const threadSchema = z.strictObject({
+const threadFields = z.strictObject({
   id: z.string(),
   sessionId: z.string(),
   question: z.string().min(1),
@@ -117,8 +117,9 @@ export const threadSchema = z.strictObject({
   version: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
   turns: z.array(turnSchema).min(1),
   route: routeSchema,
-  snapshot: nativeSnapshot,
-}).superRefine((record, context) => {
+})
+
+function validateThread(record, context) {
   try {
     parseDetail(toDetailShape(record))
     if (record.question !== record.turns[0].question || record.turns.slice(0, -1).some(turn => turn.status === 'generating')) {
@@ -127,7 +128,11 @@ export const threadSchema = z.strictObject({
   } catch {
     context.addIssue({ code: 'custom', message: 'Invalid BTW thread record' })
   }
-})
+}
+
+const threadRecordSchema = threadFields.superRefine(validateThread)
+export const threadSchema = threadFields.extend({ snapshot: nativeSnapshot }).superRefine(validateThread)
+export const archiveSchemas = { inline: threadSchema, record: threadRecordSchema, snapshot: nativeSnapshot }
 
 function fault(code, message) {
   return new RemoteError(`btw/${code}`, message)
@@ -484,7 +489,8 @@ export class BtwHost {
   async save(record, state) {
     state.controller.signal.throwIfAborted()
     const turns = record.turns.map(({ saveError, ...turn }) => turn)
-    await state.archive.put(threadSchema.parse({ ...record, turns }), state.controller.signal)
+    const schema = record.snapshot ? threadSchema : threadRecordSchema
+    await state.archive.put(schema.parse({ ...record, turns }), state.controller.signal)
   }
 
   retryTerminalSave(terminal, state) {
@@ -536,11 +542,13 @@ export class BtwHost {
   }
 
   async contextWindow(sessionId, id, requestSignal) {
-    const signal = requestSignal
-      ? AbortSignal.any([requestSignal, this.lifetime.signal])
-      : this.lifetime.signal
+    const initial = this.read(sessionId, id)
+    const state = this.sessions.get(sessionId)
+    const signal = AbortSignal.any([
+      state.controller.signal, this.lifetime.signal, ...(requestSignal ? [requestSignal] : []),
+    ])
     signal.throwIfAborted()
-    const { provider, model } = this.read(sessionId, id).route
+    const { provider, model } = initial.route
     let capacity
     try {
       const info = await this.llm.resolveModelInfo(provider, model, signal)
@@ -550,9 +558,11 @@ export class BtwHost {
     }
     signal.throwIfAborted()
     if (!Number.isSafeInteger(capacity) || capacity <= 0) return { contextWindow: null }
-    const record = this.read(sessionId, id)
+    const snapshot = initial.snapshot ?? await state.archive.loadSnapshot(id)
+    signal.throwIfAborted()
+    if (!snapshot) return { contextWindow: null }
+    const record = { ...this.read(sessionId, id), snapshot }
     const price = messages => messages.reduce((sum, message) => sum + estimateMessage(message), 0)
-    const snapshot = record.snapshot
     const messages = requestMessages(record, true)
     const promptFields = ['inputTokens', 'cacheReadTokens', 'cacheWriteTokens']
     const anchor = record.turns.findLastIndex(({ status, usage }) => {
@@ -651,7 +661,18 @@ export class BtwHost {
     const state = this.sessions.get(record.sessionId)
     const run = { controller, state, submission: newest(record) }
     this.runs.set(record.id, run)
-    const admission = Promise.resolve(state.terminalWrites.get(record.id)).catch(() => {}).then(() => this.save(record, state)).then(() => {
+    const admission = Promise.resolve(state.terminalWrites.get(record.id)).catch(() => {}).then(async () => {
+      if (!record.snapshot) {
+        const snapshot = await state.archive.loadSnapshot(record.id)
+        if (!snapshot) throw fault('snapshot-unavailable', '侧问上下文不可用。')
+        record = { ...record, snapshot }
+      }
+      try {
+        await this.save(record, state)
+      } catch {
+        this.logger?.error('BTW could not admit a question')
+        throw fault('save-failed', '保存侧问失败。')
+      }
       state.controller.signal.throwIfAborted()
       this.publish(record, true, state)
       // Start only after durable admission. No caller/transport signal is inherited.
@@ -663,8 +684,7 @@ export class BtwHost {
       return result(record)
     }).catch(error => {
       if (this.runs.get(record.id) === run) this.runs.delete(record.id)
-      this.logger?.error('BTW could not admit a question')
-      throw fault('save-failed', '保存侧问失败。')
+      throw error
     })
     run.admission = admission
     this.admissions.add(admission)
@@ -896,7 +916,7 @@ export default class BtwService extends TypertRemoteService {
   }
 
   async [Service.init]() {
-    const store = sessionThreadStore(this.ctx.sessionPersistence, record => threadSchema.parse(record), (file, reason) => {
+    const store = sessionThreadStore(this.ctx.sessionPersistence, archiveSchemas, (file, reason) => {
       this.ctx.logger?.warn('BTW ignored archive %s: %s', file, reason)
     }, (file, error) => {
       this.ctx.logger?.warn('BTW could not clean up unpublished snapshot %s: %s', file, error.code ?? error.message)
