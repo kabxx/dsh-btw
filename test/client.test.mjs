@@ -29,18 +29,29 @@ function harness() {
   })))
   const openTabs = snapshot(inventory())
   const expanded = new Map()
-  const activeKinds = new Map()
+  const activeTabs = new Map()
+  const activePanes = new Map()
   const sidebarRight = {
     mounted, openTabs,
     tabsIn: id => tabs.get(id) ?? [],
-    active: () => sidebarRight.tabsIn(mounted.getSnapshot()).find(tab => tab.kind === activeKinds.get(mounted.getSnapshot())),
+    active: () => sidebarRight.tabsIn(mounted.getSnapshot()).find(tab => tab.id === activeTabs.get(mounted.getSnapshot())),
     isExpanded: () => expanded.get(mounted.getSnapshot()) ?? false,
     toggleExpanded: () => expanded.set(mounted.getSnapshot(), !sidebarRight.isExpanded()),
-    openTabIn(id, kind) {
+    openTabIn(id, kind, { paneId = activePanes.get(id) ?? 'left' } = {}) {
       expanded.set(id, true)
-      activeKinds.set(id, kind)
-      if (sidebarRight.tabsIn(id).some(tab => tab.kind === kind)) return
-      tabs.set(id, [...sidebarRight.tabsIn(id), { id: kind, kind }])
+      activePanes.set(id, paneId)
+      const existing = sidebarRight.tabsIn(id).find(tab => tab.kind === kind && (tab.paneId ?? 'left') === paneId)
+      if (existing) {
+        activeTabs.set(id, existing.id)
+        return
+      }
+      const tabId = paneId === 'left' ? kind : `${kind}-${paneId}`
+      activeTabs.set(id, tabId)
+      tabs.set(id, [...sidebarRight.tabsIn(id), { id: tabId, kind, paneId }])
+      openTabs.set(inventory())
+    },
+    moveIn(id, tabId, paneId) {
+      tabs.set(id, sidebarRight.tabsIn(id).map(tab => tab.id === tabId ? { ...tab, paneId } : tab))
       openTabs.set(inventory())
     },
     closeIn(id, tabId) {
@@ -160,6 +171,11 @@ test('history places the newest creation last without reordering the received ro
   assert.deepEqual(rows.map(row => row.id), ['late', 'b', 'a', 'early'])
 })
 
+function paneState(controller, sessionId = 'main', tabId) {
+  const tabs = controller.getSnapshot().panes.get(sessionId)
+  return (tabId === undefined ? tabs?.values().next().value : tabs?.get(tabId)) ?? null
+}
+
 const flush = () => new Promise(resolve => queueMicrotask(resolve))
 
 // Exercise transitions against the native sidebar's per-session inventory shape.
@@ -173,39 +189,83 @@ test('switching sessions keeps each sidebar destination and respects explicit co
     controller.setPerformanceUsage('compact')
     assert.equal(controller.getSnapshot().performanceUsage, 'compact')
     assert.deepEqual(sidebarRight.tabsIn('main'), [ctx.files])
-    assert.equal(controller.getSnapshot().pane, null)
+    assert.equal(paneState(controller), null)
 
     assert.equal(controller.openDetail('main', 'thread'), true)
     const reveal = sidebarRight.openTabIn
     sidebarRight.openTabIn = () => assert.fail('in-pane navigation must not open or focus a native tab')
-    controller.navigate('main', null)
-    assert.equal(controller.getSnapshot().pane.id, null)
-    controller.navigate('main', 'thread')
-    assert.equal(controller.getSnapshot().pane.id, 'thread')
+    controller.navigate('main', ctx.sidebarRight.active().id, null)
+    assert.equal(paneState(controller).id, null)
+    controller.navigate('main', ctx.sidebarRight.active().id, 'thread')
+    assert.equal(paneState(controller).id, 'thread')
     sidebarRight.openTabIn = reveal
     mounted.set('other')
-    assert.equal(controller.getSnapshot().pane, null)
+    assert.equal(paneState(controller, 'other'), null)
     assert.equal(controller.openList('main'), false)
     assert.equal(controller.openList('other'), true)
     mounted.set('main')
     await flush()
     assert.equal(sidebarRight.isExpanded(), true)
-    assert.deepEqual(controller.getSnapshot().pane, { sessionId: 'main', id: 'thread', restored: true })
+    assert.deepEqual(paneState(controller), { id: 'thread', restored: true })
     assert.equal(sidebarRight.tabsIn('main').length, 2)
 
     sidebarRight.toggleExpanded()
     mounted.set('other')
-    assert.equal(controller.getSnapshot().pane.id, null)
+    assert.equal(paneState(controller, 'other').id, null)
     mounted.set('main')
     assert.equal(sidebarRight.isExpanded(), false)
-    assert.equal(controller.getSnapshot().pane.id, 'thread')
+    assert.equal(paneState(controller).id, 'thread')
 
     sidebarRight.closeIn('main', 'kabxx-btw')
     mounted.set('other')
     mounted.set('main')
     await flush()
-    assert.equal(controller.getSnapshot().pane, null)
+    assert.equal(paneState(controller), null)
     assert.deepEqual(sidebarRight.tabsIn('main'), [ctx.files])
+  } finally {
+    controller.dispose()
+  }
+})
+
+test('split sidebar tabs navigate independently and keep their destination when moved or revisited', async () => {
+  const ctx = harness()
+  const { sidebarRight, mounted } = ctx
+  const controller = makeController(ctx)
+  const state = tabId => paneState(controller, 'main', tabId)
+  try {
+    await flush()
+    assert.equal(controller.openDetail('main', 'thread-a'), true)
+    const left = sidebarRight.active().id
+    const leftDetail = state(left)
+    sidebarRight.openTabIn('main', 'kabxx-btw', { paneId: 'right' })
+    const right = sidebarRight.active().id
+    assert.notEqual(right, left)
+    assert.equal(state(right).id, null)
+
+    controller.navigate('main', right, 'thread-b')
+    assert.equal(state(right).id, 'thread-b')
+    assert.equal(state(left), leftDetail)
+    controller.navigate('main', right, null)
+    assert.equal(state(right).id, null)
+    assert.equal(state(right).focusId, 'thread-b')
+    assert.equal(state(left), leftDetail)
+    assert.equal(controller.openDetail('main', 'thread-b'), true)
+    assert.equal(state(right).id, 'thread-b')
+    assert.equal(state(left), leftDetail)
+
+    sidebarRight.moveIn('main', right, 'floating')
+    assert.equal(state(right).id, 'thread-b')
+    mounted.set('other')
+    controller.navigate('main', right, 'stale-click')
+    mounted.set('main')
+    await flush()
+    assert.deepEqual(state(left), { id: 'thread-a', restored: true })
+    assert.deepEqual(state(right), { id: 'thread-b', restored: true })
+
+    sidebarRight.closeIn('main', right)
+    controller.navigate('main', right, 'stale-click')
+    assert.equal(state(right), null)
+    assert.equal(state(left).id, 'thread-a')
   } finally {
     controller.dispose()
   }
@@ -219,14 +279,14 @@ test('unsent drafts stay with their session and thread until that draft is accep
   try {
     controller.openDetail('main', 'first')
     controller.setDraft('main', 'first', 'Draft A')
-    controller.navigate('main', null)
-    controller.navigate('main', 'second')
+    controller.navigate('main', ctx.sidebarRight.active().id, null)
+    controller.navigate('main', ctx.sidebarRight.active().id, 'second')
     assert.equal(controller.getDraft('main', 'second').text, '')
     controller.setDraft('main', 'second', 'Draft B')
     ctx.mounted.set('other')
     controller.setDraft('other', 'first', 'Draft C')
     ctx.mounted.set('main')
-    controller.navigate('main', 'first')
+    controller.navigate('main', ctx.sidebarRight.active().id, 'first')
     assert.equal(controller.getDraft('main', 'first').text, 'Draft A')
     assert.equal(controller.getDraft('main', 'second').text, 'Draft B')
     assert.equal(controller.getDraft('other', 'first').text, 'Draft C')
@@ -404,7 +464,7 @@ test('exact command interception, text-only envelope and independent submit', as
   assert.equal((await match('/侧问')).claim.token, '/侧问 ')
   assert.equal((await (await match('/btw')).claim.submit('')).kind, 'success')
   assert.equal((await (await match('/侧问')).claim.submit('')).kind, 'success')
-  assert.equal(controller.getSnapshot().pane.id, null)
+  assert.equal(paneState(controller).id, null)
   assert.equal((await (await match('/btw  继续讨论')).claim.submit('  继续讨论 ')).kind, 'success')
   assert.equal((await (await match('/侧问  再问一句')).claim.submit('  再问一句 ')).kind, 'success')
   assert.deepEqual(call, [['main', '继续讨论'], ['main', '再问一句']])
@@ -435,7 +495,7 @@ test('an unsaved session uses the localized native command error while leaving l
       assert.deepEqual(controller.getSnapshot().cards, {})
       const list = await match('/btw')
       assert.deepEqual(await list.claim.submit(''), { kind: 'success' })
-      assert.equal(controller.getSnapshot().pane.id, null)
+      assert.equal(paneState(controller).id, null)
       for (const [code, text] of [
         ['btw/model-unavailable', locale.modelUnavailable],
         ['btw/save-failed', locale.saveFailed],
@@ -458,11 +518,12 @@ test('explicitly reopening history resets its position but adding a card only re
   try {
     assert.equal(controller.openList('main'), true)
     const first = controller.getSnapshot()
+    const firstPane = paneState(controller)
     await controller.createCard('main', 'question')
-    assert.equal(controller.getSnapshot().pane.listOpenedAt, first.pane.listOpenedAt)
+    assert.equal(paneState(controller).listOpenedAt, firstPane.listOpenedAt)
     assert.ok(controller.getSnapshot().listRevision > first.listRevision)
     assert.equal(controller.openList('main'), true)
-    assert.ok(controller.getSnapshot().pane.listOpenedAt > first.pane.listOpenedAt)
+    assert.ok(paneState(controller).listOpenedAt > firstPane.listOpenedAt)
   } finally {
     controller.dispose()
   }
@@ -520,14 +581,14 @@ test('moving a card to the sidebar only dismisses it once the side question is v
     sidebarRight.openTabIn = () => {}
     assert.equal(controller.moveCardToSidebar('main', 'first'), false)
     assert.equal(controller.getSnapshot().cards.main.id, 'first')
-    assert.equal(controller.getSnapshot().pane.id, null)
+    assert.equal(paneState(controller).id, null)
 
     sidebarRight.openTabIn = open
     assert.equal(controller.moveCardToSidebar('main', 'stale'), false)
     assert.equal(controller.getSnapshot().cards.main.id, 'first')
     assert.equal(controller.moveCardToSidebar('main', 'first'), true)
     assert.equal(sidebarRight.isExpanded(), true)
-    assert.deepEqual(controller.getSnapshot().pane, { sessionId: 'main', id: 'first' })
+    assert.deepEqual(paneState(controller), { id: 'first' })
     assert.deepEqual(controller.getSnapshot().cards, {})
     assert.equal(controller.moveCardToSidebar('main', 'first'), false)
   } finally {
@@ -568,7 +629,7 @@ test('a card restores on return and page reopen until dismissed or moved to the 
     ctx.mounted.set('main')
     await first.restoreCard('main')
     assert.deepEqual(first.getSnapshot().cards.main, crashed)
-    assert.equal(first.getSnapshot().pane.id, 'finished')
+    assert.equal(paneState(first).id, 'finished')
     first.dispose()
 
     // The native layout can still contain a disk-restored tab on a page load.
@@ -577,7 +638,7 @@ test('a card restores on return and page reopen until dismissed or moved to the 
     await flush()
     await reopened.restoreCard('main')
     assert.deepEqual(ctx.sidebarRight.tabsIn('main'), [ctx.files])
-    assert.equal(reopened.getSnapshot().pane, null)
+    assert.equal(paneState(reopened), null)
     assert.deepEqual(reopened.getSnapshot().cards.main, crashed)
     assert.equal(reopened.moveCardToSidebar('main', 'finished'), true)
     ctx.sidebarRight.closeIn('main', 'kabxx-btw')
@@ -632,7 +693,7 @@ test('a remembered card restores on reconnect whether the first read already fai
         await flush()
         assert.equal(controller.getSnapshot().cards.main, detail)
         assert.equal(reads, 2)
-        assert.equal(controller.getSnapshot().pane, null)
+        assert.equal(paneState(controller), null)
         controller.dismiss('main', detail.id)
         ctx.emit('connection/reset')
         await flush()

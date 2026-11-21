@@ -51,14 +51,14 @@ export function makeController(ctx) {
   const drafts = new Map()
   const activeStreams = new Set()
   const threadStreams = new Set()
+  let session = sidebar.mounted.getSnapshot()
   let snapshot = {
-    cards: {}, pane: null, notice: {}, dictationAvailable: false, speechMounted: false,
+    sessionId: session, cards: {}, panes: new Map(), notice: {}, dictationAvailable: false, speechMounted: false,
     speechSettings: null, listRevision: 0, performanceUsage: defaultPerformanceUsage,
   }
-  let session = sidebar.mounted.getSnapshot()
   let selectionRevision = 0
   let restoreAttempt
-  const panes = new Map()
+  let lastListOpen = 0
   const cardIds = new Map()
   const lastAcceptedCards = new Map()
   let lastCardRequest = 0
@@ -82,7 +82,11 @@ export function makeController(ctx) {
 
   // DSH retains its own expanded state and active tab for each Session.
   function pruneRestored() {
-    if (!disposed && !panes.has(session)) closeTabs(session)
+    if (disposed || session === undefined) return
+    const tabs = snapshot.panes.get(session)
+    for (const tab of sidebar.tabsIn(session)) {
+      if (tab.kind === tabKind && tabs?.get(tab.id) === null) sidebar.closeIn(session, tab.id)
+    }
   }
 
   function queuePrune() {
@@ -94,18 +98,38 @@ export function makeController(ctx) {
     })
   }
 
-  function navigatePane(sessionId, id) {
-    const listRevision = snapshot.listRevision + 1
-    const pane = id === null ? { sessionId, id, listOpenedAt: listRevision } : { sessionId, id }
-    panes.set(sessionId, pane)
-    publish(id === null ? { pane, listRevision } : { pane })
+  function syncTabs(restoring = false) {
+    const panes = new Map()
+    for (const { sessionId, tabId, kind } of sidebar.openTabs.getSnapshot()) {
+      if (kind !== tabKind) continue
+      let tabs = panes.get(sessionId)
+      if (!tabs) {
+        tabs = new Map()
+        panes.set(sessionId, tabs)
+      }
+      const previous = snapshot.panes.get(sessionId)?.get(tabId)
+      if (previous !== undefined) tabs.set(tabId, previous)
+      else tabs.set(tabId, restoring ? null : listPane())
+    }
+    publish({ panes })
+  }
+
+  function listPane(focusId) { return { id: null, listOpenedAt: ++lastListOpen, focusId } }
+
+  function navigatePane(sessionId, tabId, id, focusId) {
+    const panes = new Map(snapshot.panes)
+    const tabs = new Map(panes.get(sessionId))
+    tabs.set(tabId, id === null ? listPane(focusId) : { id })
+    panes.set(sessionId, tabs)
+    publish({ panes })
   }
 
   function open(sessionId, id) {
     if (disposed || session !== sessionId) return false
     sidebar.openTabIn(sessionId, tabKind)
-    if (disposed || session !== sessionId || !sidebar.isExpanded() || sidebar.active()?.kind !== tabKind) return false
-    navigatePane(sessionId, id)
+    const tab = sidebar.active()
+    if (disposed || session !== sessionId || !sidebar.isExpanded() || tab?.kind !== tabKind) return false
+    navigatePane(sessionId, tab.id, id)
     return true
   }
 
@@ -182,18 +206,18 @@ export function makeController(ctx) {
     if (current === session) return
     session = current
     selectionRevision += 1
-    const pane = panes.get(session)
-    publish({ cards: {}, pane: pane ? { ...pane, restored: true } : null, notice: {} })
+    const panes = new Map(snapshot.panes)
+    const tabs = panes.get(session)
+    if (tabs) panes.set(session, new Map([...tabs].map(([tabId, pane]) => [tabId, pane && { ...pane, restored: true }])))
+    publish({ sessionId: session, cards: {}, panes, notice: {} })
     queuePrune()
   })
   const disposeInventory = sidebar.openTabs.subscribe(() => {
-    const openSessions = new Set(sidebar.openTabs.getSnapshot().filter(tab => tab.kind === tabKind).map(tab => tab.sessionId))
-    for (const id of panes.keys()) {
-      if (!openSessions.has(id)) panes.delete(id)
-    }
-    if (snapshot.pane && !panes.has(snapshot.pane.sessionId)) publish({ pane: null })
+    syncTabs()
     queuePrune()
   })
+  // DSH seeds this inventory with tabs saved before this page opened.
+  syncTabs(true)
   queuePrune()
 
   function observe(start, settled, onNext, onError) {
@@ -275,8 +299,11 @@ export function makeController(ctx) {
       dismissCard(sessionId, id)
       return true
     },
-    navigate(sessionId, id) {
-      if (!disposed && session === sessionId && panes.has(sessionId)) navigatePane(sessionId, id)
+    navigate(sessionId, tabId, id) {
+      const pane = snapshot.panes.get(sessionId)?.get(tabId)
+      if (!disposed && session === sessionId && pane) {
+        navigatePane(sessionId, tabId, id, pane.id)
+      }
     },
     restoreCard,
     dismiss: dismissCard,
@@ -500,12 +527,7 @@ function mountFeatures(ctx, React) {
   })))
   ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
     name: 'sidebar.right.pane.tab', key: plugin, locale: namespace,
-  }, props => {
-    const snapshot = React.useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot)
-    React.useLayoutEffect(() => { controller.pruneRestored() }, [props.sessionId])
-    if (snapshot.pane?.sessionId !== props.sessionId) return null
-    return React.createElement(Pane, { ...props, controller, t: props.t ?? t })
-  })))
+  }, props => React.createElement(Pane, { ...props, controller, t: props.t ?? t }))))
   ctx.effect(() => ctx.inputTriggers.registerSource(makeSource(controller, t, CommandIcon)))
   ctx.inject(['configForms'], scope => {
     scope.effect(() => {

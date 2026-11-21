@@ -1028,13 +1028,17 @@ export function createViews(React) {
       card && h(DockCard, { key: card.id, detail: card, controller, sessionId, t, renderFactorySlot }));
   }
 
-  function List({ controller, sessionId, t, language, focusId, listRevision }) {
+  function List({ controller, sessionId, t, language, focusId, listRevision, onOpen }) {
     const [load, setLoad] = useState({});
     const [retry, setRetry] = useState(0);
     const scroller = useRef(null);
     const positioned = useRef(false);
     const focusTarget = useRef(null);
+    const heading = useRef(null);
     const scopeId = useId();
+    useLayoutEffect(() => {
+      if (focusId) heading.current?.focus({ preventScroll: true });
+    }, [focusId]);
     useEffect(() => {
       let alive = true;
       Promise.resolve().then(() => controller.call('list', sessionId)).then(rows => {
@@ -1048,7 +1052,8 @@ export function createViews(React) {
       positioned.current = true;
       list.scrollTop = list.scrollHeight;
       const previousRow = focusTarget.current;
-      if (focusId && previousRow) {
+      const title = heading.current;
+      if (focusId && previousRow && title?.ownerDocument.activeElement === title) {
         const rowBounds = previousRow.getBoundingClientRect();
         const listBounds = list.getBoundingClientRect();
         const visible = rowBounds.top >= listBounds.top && rowBounds.bottom <= listBounds.bottom;
@@ -1060,7 +1065,7 @@ export function createViews(React) {
     return h(Fragment, null,
       h('header', { className: 'dsh-btw-bar' },
         h(SideQuestionIcon, { className: 'dsh-btw-mark' }),
-        h('h2', { id: scopeId, className: 'dsh-btw-bar-title' }, t('listTitle'))),
+        h('h2', { id: scopeId, ref: heading, tabIndex: -1, className: 'dsh-btw-bar-title' }, t('listTitle'))),
       h('section', { className: 'dsh-btw-list', ref: scroller, 'aria-labelledby': scopeId },
         load.failed ? h(Feedback, { text: t('loadFailed'), t, onRetry: reload, error: true }) :
           !load.rows ? h(LoadingNote, { t }) :
@@ -1068,7 +1073,7 @@ export function createViews(React) {
               h('ul', { className: 'dsh-btw-history' }, load.rows.map(row =>
                 h('li', { key: row.id }, h('button', {
                   type: 'button', className: 'dsh-btw-row', title: row.question,
-                  ref: focusId === row.id ? focusTarget : null, onClick: () => controller.navigate(sessionId, row.id),
+                  ref: focusId === row.id ? focusTarget : null, onClick: () => onOpen(row.id),
                 },
                 h('span', { className: 'dsh-btw-row-text' }, row.question),
                 h('span', { className: 'dsh-btw-row-time' }, h(Time, { value: row.createdAt ?? row.updatedAt, language })),
@@ -1535,24 +1540,27 @@ export function createViews(React) {
           h(UsageAudit, { turns: detail.turns, contextSample: context, performanceUsage, t, language }))));
   }
 
-  function OpenPane({ controller, sessionId, t, renderFactorySlot, pane, dictationAvailable, speechMounted, speechSettings, language, listRevision, performanceUsage }) {
-    const focusId = useRef(null);
+  function OpenPane({ controller, sessionId, t, renderFactorySlot, pane, dictationAvailable, speechMounted, speechSettings, language, listRevision, performanceUsage, navigate }) {
     const id = pane.id;
     return h('section', { className: 'dsh-btw-pane', 'aria-label': t('title'), lang: language },
       h('style', null, styles),
       id ? h(Chat, {
         key: id, controller, sessionId, id, pane,
         t, renderFactorySlot, language, dictationAvailable, speechMounted, speechSettings, performanceUsage,
-        onBack: () => { focusId.current = id; controller.navigate(sessionId, null); },
-      }) : h(List, { key: pane.listOpenedAt, controller, sessionId, t, language, focusId: focusId.current, listRevision }));
+        onBack: () => navigate(null),
+      }) : h(List, { key: pane.listOpenedAt, controller, sessionId, t, language,
+        focusId: pane.restored ? undefined : pane.focusId, listRevision, onOpen: navigate }));
   }
 
-  function Pane({ controller, sessionId, t, renderFactorySlot, language }) {
+  function Pane({ controller, sessionId, t, renderFactorySlot, language, useTabInfo }) {
+    const { tab } = useTabInfo();
     const snapshot = useSnapshot(controller);
-    if (!sessionId || snapshot.pane?.sessionId !== sessionId) return null;
+    const pane = snapshot.panes.get(sessionId)?.get(tab.id);
+    if (!pane || snapshot.sessionId !== sessionId) return null;
     return h(OpenPane, {
-      key: sessionId, controller, sessionId, t, renderFactorySlot, language,
-      pane: snapshot.pane, dictationAvailable: snapshot.dictationAvailable, speechMounted: snapshot.speechMounted,
+      key: tab.id, controller, sessionId, t, renderFactorySlot, language, pane,
+      navigate: id => controller.navigate(sessionId, tab.id, id),
+      dictationAvailable: snapshot.dictationAvailable, speechMounted: snapshot.speechMounted,
       speechSettings: snapshot.speechSettings, listRevision: snapshot.listRevision, performanceUsage: snapshot.performanceUsage,
     });
   }
