@@ -49,6 +49,7 @@
     "input": "Enter a message",
     "send": "Send follow-up",
     "sendFailed": "Failed to send follow-up.",
+    "snapshotUnavailable": "The context for this side question is unavailable. Start a new side question.",
     "stillGenerating": "The previous reply is still generating.",
     "micStart": "Start recording",
     "micStop": "Stop and transcribe",

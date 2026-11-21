@@ -287,7 +287,8 @@ export function makeController(ctx) {
         publishDraft(sessionId, id, { ...current, ...remaining, saving: false, receipt })
       } catch (error) {
         const messageKey = error?.code === 'btw/context-overflow' ? 'contextOverflow'
-          : error?.code === 'btw/generating' ? 'stillGenerating' : 'sendFailed'
+          : error?.code === 'btw/generating' ? 'stillGenerating'
+          : error?.code === 'btw/snapshot-unavailable' ? 'snapshotUnavailable' : 'sendFailed'
         publishDraft(sessionId, id, { ...getDraft(sessionId, id), saving: false, error: messageKey })
         throw error
       }

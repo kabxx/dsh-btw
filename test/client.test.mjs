@@ -381,6 +381,25 @@ test('a competing follow-up retains the draft and reports that the reply is gene
   }
 })
 
+test('a missing follow-up snapshot tells the user to start a new side question', async () => {
+  const ctx = harness()
+  const controller = makeController(ctx)
+  ctx.remote.btw.submitFollowup = async () => ({ ok: false, error: {
+    code: 'btw/snapshot-unavailable', message: 'Host rejection'
+  } })
+  try {
+    controller.setDraft('main', 'thread', 'still unsent')
+    await assert.rejects(controller.submitDraft('main', 'thread'), { code: 'btw/snapshot-unavailable' })
+    const draft = controller.getDraft('main', 'thread')
+    assert.equal(zh.ui[draft.error], '侧问上下文已失效。请发起新的侧问。')
+    assert.equal(en.ui[draft.error], 'The context for this side question is unavailable. Start a new side question.')
+    assert.equal(draft.text, 'still unsent')
+    assert.equal(draft.saving, false)
+  } finally {
+    controller.dispose()
+  }
+})
+
 test('each active first-question submission has its own ID even with identical text', async () => {
   const ctx = harness()
   const controller = makeController(ctx)
