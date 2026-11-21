@@ -2,11 +2,12 @@ import { randomUUID } from 'node:crypto'
 import { renameSync } from 'node:fs'
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { dirname, isAbsolute, join, relative, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { PACKAGE_NAME, parseThreadId } from '../shared/wire.js'
 
 const { version } = createRequire(import.meta.url)('../../package.json')
-const SCHEMA_VERSION = 1
+const INLINE_SCHEMA_VERSION = 1
+const SCHEMA_VERSION = 2
 const releaseDirectory = /^v\d+\.\d+\.\d+$/u
 
 async function listDirectory(directory) {
@@ -16,6 +17,33 @@ async function listDirectory(directory) {
     if (error?.code !== 'ENOENT') throw error
     return []
   }
+}
+
+async function replaceArchiveFile(sessionDirectory, file, value, ownerSignal) {
+  ownerSignal.throwIfAborted()
+  let directory = sessionDirectory
+  for (const part of relative(sessionDirectory, dirname(file)).split(sep)) {
+    directory = join(directory, part)
+    // Start below the session root so a removed session cannot be recreated here.
+    await mkdir(directory, { mode: 0o700 }).catch(error => {
+      if (error.code !== 'EEXIST') throw error
+    })
+  }
+  const temporary = `${file}.${randomUUID()}.tmp`
+  try {
+    await writeFile(temporary, `${JSON.stringify(value)}\n`, { flag: 'wx', mode: 0o600 })
+    // Agent scope teardown revokes writes before the main session lease closes.
+    // Keep the ownership check and final replacement in the same JS turn.
+    ownerSignal.throwIfAborted()
+    renameSync(temporary, file)
+  } catch (error) {
+    await unlink(temporary).catch(() => {})
+    throw error
+  }
+}
+
+function snapshotFileFor(file) {
+  return join(dirname(dirname(file)), 'snapshots', basename(file))
 }
 
 export function sessionThreadStore(persistence, parseRecord, onMalformedRecord) {
@@ -60,10 +88,29 @@ export function sessionThreadStore(persistence, parseRecord, onMalformedRecord) 
             onMalformedRecord?.(file, 'invalid archive envelope')
             continue
           }
-          if (envelope.schemaVersion !== SCHEMA_VERSION) continue
+          const { schemaVersion } = envelope
+          if (schemaVersion !== INLINE_SCHEMA_VERSION && schemaVersion !== SCHEMA_VERSION) continue
+          const hasSnapshot = schemaVersion === SCHEMA_VERSION
+          let storedRecord = envelope.record
+          if (hasSnapshot) {
+            const snapshotFile = snapshotFileFor(file)
+            const snapshotContents = await readFile(snapshotFile, { encoding: 'utf8', signal }).catch(error => {
+              if (error.code !== 'ENOENT') throw error
+            })
+            if (snapshotContents === undefined) {
+              onMalformedRecord?.(file, 'missing thread snapshot')
+              continue
+            }
+            try {
+              storedRecord = { ...storedRecord, snapshot: JSON.parse(snapshotContents) }
+            } catch {
+              onMalformedRecord?.(file, 'invalid thread snapshot JSON')
+              continue
+            }
+          }
           let record
           try {
-            record = parseRecord(envelope.record)
+            record = parseRecord(storedRecord)
           } catch {
             onMalformedRecord?.(file, 'invalid thread record')
             continue
@@ -73,38 +120,25 @@ export function sessionThreadStore(persistence, parseRecord, onMalformedRecord) 
             onMalformedRecord?.(file, 'invalid or duplicate thread filename')
             continue
           }
-          files.set(record.id, file)
+          files.set(record.id, { file, hasSnapshot })
           records.push(record)
         }
       }
       signal.throwIfAborted()
       return {
         records,
-        async put(record, ownerSignal = signal) {
+        async put({ snapshot, ...record }, ownerSignal = signal) {
           ownerSignal.throwIfAborted()
           const id = parseThreadId(record.id)
-          const file = files.get(id) ?? join(root, `v${version}`, 'threads', `${id}.json`)
-          let directory = sessionDirectory
-          for (const part of relative(sessionDirectory, dirname(file)).split(sep)) {
-            directory = join(directory, part)
-            // Start below the session root so a removed session cannot be recreated here.
-            await mkdir(directory, { mode: 0o700 }).catch(error => {
-              if (error.code !== 'EEXIST') throw error
-            })
+          const existing = files.get(id)
+          const file = existing?.file ?? join(root, `v${version}`, 'threads', `${id}.json`)
+          if (!existing?.hasSnapshot) {
+            // Publish the frozen prefix first. Until the thread replacement
+            // succeeds, a previous inline record can still be opened as-is.
+            await replaceArchiveFile(sessionDirectory, snapshotFileFor(file), snapshot, ownerSignal)
+            files.set(id, { file, hasSnapshot: true })
           }
-          const temporary = `${file}.${randomUUID()}.tmp`
-          try {
-            const envelope = { schemaVersion: SCHEMA_VERSION, record }
-            await writeFile(temporary, `${JSON.stringify(envelope)}\n`, { flag: 'wx', mode: 0o600 })
-            // DSH emits agent/disposed before releasing its session write lease.
-            // Keep the ownership check and final replacement in the same JS turn.
-            ownerSignal.throwIfAborted()
-            renameSync(temporary, file)
-          } catch (error) {
-            await unlink(temporary).catch(() => {})
-            throw error
-          }
-          files.set(id, file)
+          await replaceArchiveFile(sessionDirectory, file, { schemaVersion: SCHEMA_VERSION, record }, ownerSignal)
         },
       }
     },

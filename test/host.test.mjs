@@ -53,9 +53,11 @@ async function sessionFolder(t) {
   return {
     directory, location: { kind: 'jsonl', path }, archiveFile,
     async read(id) {
-      const envelope = JSON.parse(await readFile(archiveFile(id), 'utf8'))
-      assert.equal(envelope.schemaVersion, 1)
-      return envelope.record
+      const file = archiveFile(id)
+      const envelope = JSON.parse(await readFile(file, 'utf8'))
+      assert.equal(envelope.schemaVersion, 2)
+      const snapshot = JSON.parse(await readFile(join(dirname(dirname(file)), 'snapshots', `${id}.json`), 'utf8'))
+      return { ...envelope.record, snapshot }
     },
   }
 }

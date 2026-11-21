@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
-import fs, { mkdir, mkdtempDisposable, readFile, writeFile } from 'node:fs/promises'
-import { syncBuiltinESMExports } from 'node:module'
+import { existsSync } from 'node:fs'
+import fs, { mkdir, mkdtempDisposable, readFile, readdir, stat, utimes, writeFile } from 'node:fs/promises'
+import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -118,4 +119,102 @@ test('archive reads still report filesystem errors and respect aborts', async ()
   const store = makeStore(path, () => assert.fail('Filesystem errors are separate from malformed records'))
   await assert.rejects(store.open(sessionId, new AbortController().signal), { code: 'ENOTDIR' })
   await assert.rejects(store.open(sessionId, AbortSignal.abort()), { name: 'AbortError' })
+})
+
+test('progress writes keep a large frozen snapshot in one immutable file', async () => {
+  await using scratch = await mkdtempDisposable(join(tmpdir(), 'dsh-btw-split-archive-'))
+  const path = join(scratch.path, 'session.jsonl')
+  await writeFile(path, 'main transcript fixture\n')
+  const { version } = createRequire(import.meta.url)('../package.json')
+  const directory = join(scratch.path, 'plugins', PACKAGE_NAME, `v${version}`)
+  const threadFile = join(directory, 'threads', `${healthyId}.json`)
+  const snapshotFile = join(directory, 'snapshots', `${healthyId}.json`)
+  const record = makeRecord(healthyId)
+  record.snapshot.system = 'x'.repeat(256 * 1024)
+  const store = makeStore(path)
+  const { signal } = new AbortController()
+  const opened = await store.open(sessionId, signal)
+  await opened.put(record)
+  await utimes(snapshotFile, new Date(0), new Date(0))
+  const originalSnapshotStats = await stat(snapshotFile)
+  const updated = {
+    ...record, version: 2,
+    turns: [{ ...record.turns[0], reply: 'extended answer' }],
+  }
+  await opened.put(updated)
+  const reopened = await store.open(sessionId, signal)
+  assert.deepEqual(reopened.records, [updated])
+  const final = {
+    ...updated, version: 3,
+    turns: [{ ...updated.turns[0], reply: 'complete answer' }],
+  }
+  await reopened.put(final)
+  assert.deepEqual((await store.open(sessionId, signal)).records, [final])
+  assert.deepEqual(await readdir(join(directory, 'snapshots')), [`${healthyId}.json`])
+  assert.deepEqual(JSON.parse(await readFile(snapshotFile, 'utf8')), record.snapshot)
+  assert.equal((await stat(snapshotFile)).mtimeMs, originalSnapshotStats.mtimeMs)
+  assert.ok((await stat(threadFile)).size < 1024)
+  const { snapshot, ...diskRecord } = final
+  assert.deepEqual(JSON.parse(await readFile(threadFile, 'utf8')), { schemaVersion: 2, record: diskRecord })
+  assert.equal(await readFile(path, 'utf8'), 'main transcript fixture\n')
+})
+
+test('interrupted inline migration keeps the legacy record readable', async () => {
+  await using scratch = await mkdtempDisposable(join(tmpdir(), 'dsh-btw-interrupted-migration-'))
+  const path = join(scratch.path, 'session.jsonl')
+  const directory = join(scratch.path, 'plugins', PACKAGE_NAME, 'v0.0.9')
+  const file = join(directory, 'threads', `${healthyId}.json`)
+  await mkdir(join(directory, 'threads'), { recursive: true })
+  await writeFile(path, 'main transcript fixture\n')
+  const legacy = makeRecord(healthyId)
+  await writeFile(file, JSON.stringify({ schemaVersion: 1, record: legacy }))
+  const store = makeStore(path)
+  const { signal } = new AbortController()
+  const opened = await store.open(sessionId, signal)
+  const edited = { ...legacy, version: 2 }
+  const snapshotFile = join(directory, 'snapshots', `${healthyId}.json`)
+  const stopped = new AbortController()
+  const stopAfterSnapshotPublish = {
+    throwIfAborted() {
+      if (existsSync(snapshotFile)) stopped.abort()
+      stopped.signal.throwIfAborted()
+    },
+  }
+  await assert.rejects(opened.put(edited, stopAfterSnapshotPublish), { name: 'AbortError' })
+  assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), { schemaVersion: 1, record: legacy })
+  assert.deepEqual(JSON.parse(await readFile(snapshotFile, 'utf8')), legacy.snapshot)
+  assert.deepEqual(await readdir(join(directory, 'threads')), [`${healthyId}.json`])
+  const reopened = await store.open(sessionId, signal)
+  assert.deepEqual(reopened.records, [legacy])
+  await reopened.put(edited)
+  assert.deepEqual((await store.open(sessionId, signal)).records, [edited])
+  assert.equal(JSON.parse(await readFile(file, 'utf8')).schemaVersion, 2)
+})
+
+test('dangling and malformed snapshot files are isolated to their thread', async () => {
+  await using scratch = await mkdtempDisposable(join(tmpdir(), 'dsh-btw-missing-snapshot-'))
+  const path = join(scratch.path, 'session.jsonl')
+  const directory = join(scratch.path, 'plugins', PACKAGE_NAME, 'v0.0.9')
+  await mkdir(join(directory, 'threads'), { recursive: true })
+  await mkdir(join(directory, 'snapshots'))
+  await writeFile(path, 'main transcript fixture\n')
+  const healthy = makeRecord(healthyId)
+  await writeFile(join(directory, 'threads', `${healthyId}.json`), JSON.stringify({ schemaVersion: 1, record: healthy }))
+  const { snapshot, ...unlinked } = makeRecord(newId)
+  await writeFile(join(directory, 'snapshots', `${healthyId}.json`), JSON.stringify(null))
+  const file = join(directory, 'threads', `${newId}.json`)
+  const warnings = []
+  const store = makeStore(path, (file, reason) => warnings.push([file, reason]))
+  const { signal } = new AbortController()
+  // An orphan from a write interrupted before publishing the thread is invisible.
+  await writeFile(join(directory, 'snapshots', `${newId}.json`), JSON.stringify(snapshot))
+  assert.deepEqual((await store.open(sessionId, signal)).records, [healthy])
+  assert.deepEqual(warnings, [])
+  await writeFile(file, JSON.stringify({ schemaVersion: 2, record: unlinked }))
+  await writeFile(join(directory, 'snapshots', `${newId}.json`), '{')
+  const missingId = 'btw-12345678-1234-1234-1234-123456789014'
+  const otherFile = join(directory, 'threads', `${missingId}.json`)
+  await writeFile(otherFile, JSON.stringify({ schemaVersion: 2, record: { ...unlinked, id: missingId } }))
+  assert.deepEqual((await store.open(sessionId, signal)).records, [healthy])
+  assert.deepEqual(new Map(warnings), new Map([[file, 'invalid thread snapshot JSON'], [otherFile, 'missing thread snapshot']]))
 })
