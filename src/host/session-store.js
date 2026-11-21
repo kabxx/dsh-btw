@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { renameSync } from 'node:fs'
+import { renameSync, unlinkSync } from 'node:fs'
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
@@ -46,7 +46,7 @@ function snapshotFileFor(file) {
   return join(dirname(dirname(file)), 'snapshots', basename(file))
 }
 
-export function sessionThreadStore(persistence, parseRecord, onMalformedRecord) {
+export function sessionThreadStore(persistence, parseRecord, onMalformedRecord, onSnapshotCleanupError) {
   return {
     async open(sessionId, signal) {
       const snapshot = await persistence.stat(sessionId, { signal })
@@ -132,13 +132,26 @@ export function sessionThreadStore(persistence, parseRecord, onMalformedRecord) 
           const id = parseThreadId(record.id)
           const existing = files.get(id)
           const file = existing?.file ?? join(root, `v${version}`, 'threads', `${id}.json`)
+          const snapshotFile = snapshotFileFor(file)
           if (!existing?.hasSnapshot) {
-            // Publish the frozen prefix first. Until the thread replacement
-            // succeeds, a previous inline record can still be opened as-is.
-            await replaceArchiveFile(sessionDirectory, snapshotFileFor(file), snapshot, ownerSignal)
-            files.set(id, { file, hasSnapshot: true })
+            // Publish the frozen prefix first so either archive format stays readable.
+            await replaceArchiveFile(sessionDirectory, snapshotFile, snapshot, ownerSignal)
           }
-          await replaceArchiveFile(sessionDirectory, file, { schemaVersion: SCHEMA_VERSION, record }, ownerSignal)
+          try {
+            await replaceArchiveFile(sessionDirectory, file, { schemaVersion: SCHEMA_VERSION, record }, ownerSignal)
+          } catch (error) {
+            // A failed first admission has no thread referencing this snapshot.
+            // Keep the ownership check and cleanup in the same JS turn.
+            if (!existing && !ownerSignal.aborted) {
+              try {
+                unlinkSync(snapshotFile)
+              } catch (cleanupError) {
+                if (cleanupError.code !== 'ENOENT') onSnapshotCleanupError?.(snapshotFile, cleanupError)
+              }
+            }
+            throw error
+          }
+          if (!existing?.hasSnapshot) files.set(id, { file, hasSnapshot: true })
         },
       }
     },

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, mkdtempDisposable, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, mkdtempDisposable, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -233,6 +233,41 @@ test('an old Host stops writing before the successor takes over the session', { 
   } finally {
     releaseOldWrite.resolve()
     await Promise.all([hostA.close(), hostB.close()])
+  }
+})
+
+test('a failed first archive write rolls back its snapshot before retrying the same submission', { timeout: 5000 }, async t => {
+  const fixture = await sessionFolder(t)
+  const archive = sessionThreadStore({ stat: async () => ({ location: fixture.location }) }, record => threadSchema.parse(record))
+  const llm = controlledModel()
+  const host = new BtwHost({ store: archive, llm })
+  const agent = makeAgent('session-create-retry')
+  agent.session.messages.push(msg('main-context', 'user', 'frozen context'))
+  const submissionId = 'a'.repeat(32)
+  const threads = dirname(fixture.archiveFile('fixture'))
+  const snapshots = join(dirname(threads), 'snapshots')
+  try {
+    assert.equal(await host.prepare(agent.session.id, undefined, agent), true)
+    await mkdir(dirname(threads), { recursive: true })
+    await writeFile(threads, 'block the thread directory after the snapshot can be written')
+    await assert.rejects(host.create(agent, 'side question', undefined, submissionId), { code: 'btw/save-failed' })
+    assert.deepEqual(await readdir(snapshots), [])
+    assert.deepEqual(host.list(agent.session.id), [])
+    assert.equal(llm.calls.length, 0)
+
+    await unlink(threads)
+    const { id } = await host.create(agent, 'side question', undefined, submissionId)
+    const call = await llm.waitForCount(1)
+    call.emit(text('answer'))
+    call.emit(finish())
+    await terminal(host.watch(agent.session.id, id, null, () => {}))
+    assert.deepEqual(await readdir(threads), [`${id}.json`])
+    assert.deepEqual(await readdir(snapshots), [`${id}.json`])
+    assert.equal((await fixture.read(id)).turns[0].submissionId, submissionId)
+    assert.equal(llm.calls.length, 1)
+    assert.equal(await readFile(fixture.location.path, 'utf8'), 'main transcript fixture')
+  } finally {
+    await host.close()
   }
 })
 
