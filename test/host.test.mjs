@@ -767,6 +767,50 @@ test('independent whitespace blocks survive streaming, archiving and follow-up r
   } finally { await host.close() }
 })
 
+test('clean EOF completes a reply while a thrown stream failure is excluded from replay', { timeout: 5000 }, async () => {
+  const store = memoryStore()
+  const requests = []
+  const host = new BtwHost({
+    store,
+    llm: {
+      async *stream(options) {
+        requests.push(options.messages)
+        if (requests.length === 1) {
+          yield text('Complete answer without a finish event')
+        } else if (requests.length === 2) {
+          yield text('Partial answer before the stream failed')
+          throw new Error('private transport diagnostic')
+        }
+      },
+    },
+  })
+  const agent = makeAgent('session-reply-eof')
+  const done = async (sessionId, id) => latest(await terminal(host.watch(sessionId, id, undefined, () => {})))
+  try {
+    const { id, sessionId } = await host.create(agent, 'First question')
+    const first = await done(sessionId, id)
+    assert.equal(first.status, 'completed')
+    assert.equal(first.reply, 'Complete answer without a finish event')
+    assert.equal(latest(store.saved.get(id)).modelReply.content[0].text, first.reply)
+
+    await host.followup(sessionId, id, 'Second question')
+    const second = await done(sessionId, id)
+    assert.equal(second.status, 'failed')
+    assert.equal(second.reply, 'Partial answer before the stream failed')
+    assert.equal(second.error, '回复生成失败。')
+    assert.equal(latest(store.saved.get(id)).modelReply, undefined)
+
+    await host.followup(sessionId, id, 'Third question')
+    const third = await done(sessionId, id)
+    assert.equal(third.status, 'failed')
+    assert.equal(third.reply, '')
+    assert.equal(third.error, '模型未返回文本内容。')
+    assert.deepEqual(requests[2].filter(message => message.role === 'assistant').map(message => message.content[0].text), [first.reply])
+  } finally {
+    await host.close()
+  }
+})
+
 test('native reply failures expose only known codes and never provider diagnostics', async () => {
   const host = new BtwHost({
     store: memoryStore(),

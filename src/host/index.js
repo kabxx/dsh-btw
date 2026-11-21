@@ -722,11 +722,6 @@ export class BtwHost {
           firstTokenMs = Math.round(performance.now() - startedAt)
         }
         assembler.push(chunk)
-        if (chunk.type === 'finish') {
-          finish = chunk.reason.kind
-          if (finish === 'error') failureCode = chunk.reason.failure?.code
-          break
-        }
         if (chunk.type !== 'text-delta' && !(chunk.type === 'block-end' && chunk.block.type === 'text')) continue
         const reply = previewReply(assembler)
         const time = Date.now()
@@ -739,6 +734,9 @@ export class BtwHost {
           previewTimer = setTimeout(sendPreview, PREVIEW_INTERVAL_MS - (time - lastNotified))
         }
       }
+      const reason = assembler.finish
+      finish = reason.kind
+      if (reason.kind === 'error') failureCode = reason.failure?.code
     } catch (error) {
       // Never expose raw provider diagnostics through side-question history.
       failureCode = error?.code
