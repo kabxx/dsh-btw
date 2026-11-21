@@ -524,7 +524,7 @@ function mountFeatures(ctx, React) {
     name: 'sidebar.right.pane.tab.title', key: plugin,
   }, TabTitle)))
   ctx.effect(() => ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
-    name: 'conversation.input.dock', id: 'kabxx-btw-dock', order: 30, locale: namespace,
+    name: 'conversation.input.dock', id: 'kabxx-btw-dock', order: 15, locale: namespace,
   }, props => {
     React.useLayoutEffect(() => { controller.pruneRestored() }, [props.sessionId])
     return React.createElement(Dock, { ...props, controller, t: props.t ?? t })
