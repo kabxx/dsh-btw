@@ -5,7 +5,7 @@ import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { inject, makeController, makeSource, mountClient, observeSpeech } from '../src/client/index.js'
 import { applyThreadEvent, applyReply, parseSessionId, parseTurn } from '../src/shared/wire.js'
-import { contextReading, createCompositionGuard, formatMessageTime, formatTokenCount, isFollowupSubmitKey, orderHistory, summarizeUsage } from '../src/client/views.js'
+import { contextReading, createCompositionGuard, formatMessageTime, formatTokenCount, isFollowupSubmitKey, orderHistory, summarizeUsage, turnCacheRatio } from '../src/client/views.js'
 import zh from '../locale/zh.json' with { type: 'json' }
 import en from '../locale/en.json' with { type: 'json' }
 
@@ -89,6 +89,21 @@ test('usage prefers each reported total and falls back to available buckets', ()
     { status: 'generating', usage: { totalTokens: 1_000 } },
   ]), { uncached: 20, cacheRead: 5, cacheWrite: 5, output: 8, total: 140, cacheRatio: 5 / 30 })
 })
+
+test('per-reply cache hit uses the exact prompt total and preserves missing cache buckets', () => {
+  const reported = { inputTokens: 10, outputTokens: 5, totalTokens: 115 };
+  assert.equal(turnCacheRatio({ ...reported, cacheReadTokens: 50 }), 50 / 110);
+  assert.equal(turnCacheRatio({ ...reported, cacheWriteTokens: 50 }), null);
+  assert.equal(turnCacheRatio({ ...reported, cacheReadTokens: 0 }), 0);
+
+  const complete = { inputTokens: 10, outputTokens: 5, cacheReadTokens: 50, cacheWriteTokens: 50 };
+  assert.equal(turnCacheRatio(complete), 50 / 110);
+  assert.equal(turnCacheRatio({ ...complete, cacheWriteTokens: undefined }), null);
+  assert.equal(turnCacheRatio({ ...reported, outputTokens: undefined, cacheReadTokens: 50 }), null);
+  assert.equal(turnCacheRatio({ ...reported, totalTokens: 25, cacheReadTokens: 50 }), null);
+  assert.equal(turnCacheRatio({ ...complete, totalTokens: 120 }), null);
+  assert.equal(turnCacheRatio({ inputTokens: 0, outputTokens: 5, totalTokens: 5, cacheReadTokens: 0 }), null);
+});
 
 test('a late Safari composition confirmation cannot submit the draft', () => {
   let time = 100;

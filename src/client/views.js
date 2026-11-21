@@ -618,6 +618,25 @@ export function summarizeUsage(turns) {
     cacheRatio: prompt > 0 ? cacheRead / prompt : null };
 }
 
+export function turnCacheRatio(usage) {
+  const { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, reasoningTokens } = usage ?? {};
+  // Follow DSH's turn accounting: absent cache buckets are unknown, not zero.
+  if (inputTokens === undefined || outputTokens === undefined || cacheReadTokens === undefined) return null;
+  if (reasoningTokens !== undefined && reasoningTokens > outputTokens) return null;
+
+  const knownPrompt = inputTokens + cacheReadTokens + (cacheWriteTokens ?? 0);
+  if (!Number.isSafeInteger(knownPrompt)) return null;
+  if (totalTokens === undefined) {
+    if (cacheWriteTokens === undefined || !Number.isSafeInteger(knownPrompt + outputTokens)) return null;
+    return knownPrompt > 0 ? cacheReadTokens / knownPrompt : null;
+  }
+
+  const prompt = totalTokens - outputTokens;
+  if (prompt <= 0 || prompt < knownPrompt) return null;
+  if (cacheWriteTokens !== undefined && prompt !== knownPrompt) return null;
+  return cacheReadTokens / prompt;
+}
+
 export function formatTokenCount(value) {
   const format = amount => String(amount >= 100 ? Math.round(amount) : Math.round(amount * 10) / 10);
   if (value < 1_000) return String(value);
@@ -889,11 +908,11 @@ export function createViews(React) {
     const [open, setOpen] = useState(false);
     const trigger = useRef(null);
     const id = useId();
-    const { uncached, cacheRead, cacheWrite, output, total, cacheRatio } = summarizeUsage([turn]);
+    const { uncached, cacheRead, cacheWrite, output, total } = summarizeUsage([turn]);
     const enabled = performanceUsage !== 'compact' && total > 0;
     const number = new Intl.NumberFormat(language || undefined);
     const reading = t('auditSpent', { total: `${formatTokenCount(total)} tok` });
-    const cache = formatCacheRatio(cacheRatio, language, 1);
+    const cache = formatCacheRatio(turnCacheRatio(turn.usage), language, 1);
     const rows = [[t('auditTotal'), number.format(total)]];
     if (cache !== null) rows.push([t('auditCacheHit'), cache]);
     if (turn.usage?.inputTokens !== undefined) rows.push([t('auditInput'), number.format(uncached)]);
